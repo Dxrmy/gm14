@@ -1,0 +1,10 @@
+*.o
+*.a
+*.so
+*.dll
+*.exe
+gm14_host
+vm_host
+out_room_*.png
+vm_frame.png
+build/

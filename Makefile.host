@@ -1,0 +1,14 @@
+# Host build for the gm14 C++ core (Linux/macOS).
+CXX ?= g++
+CXXFLAGS ?= -std=c++17 -O2 -Wall
+
+all: gm14_host vm_host
+
+gm14_host: main_host.cpp dw.cpp dw.hpp
+	$(CXX) $(CXXFLAGS) -o $@ main_host.cpp dw.cpp
+
+vm_host: vm_host.cpp vm.cpp dw.cpp vm.hpp dw.hpp
+	$(CXX) $(CXXFLAGS) -o $@ vm_host.cpp vm.cpp dw.cpp
+
+clean:
+	rm -f gm14_host vm_host out_room_*.png vm_frame.png
