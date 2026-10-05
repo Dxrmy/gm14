@@ -1,12 +1,40 @@
 # gm14
 
-Platform-agnostic C++17 runtime for compiled **GameMaker: Studio 1.4** games
-(`data.win`, cookie `FORM`, bytecode v15/16). It parses every IFF chunk, decodes
-the `CODE` bytecode, resolves `VARI`/`FUNC` reference chains, and executes a
-bytecode VM over object events (`Create`/`Step`/`Draw`/`Alarm`/`Other`).
+**gm14 is a standalone C++17 runtime that plays compiled GameMaker: Studio 1.4
+games (`data.win`) on modern hardware.** The same portable core also powers the
+Nintendo 3DS front-end in [`gm14-3ds`](https://github.com/Dxrmy/gm14-3ds).
 
-This repository contains **only the portable core** — no libctru / Citro3D /
-console SDK headers. The Nintendo 3DS front-end lives in `gm14-3ds`.
+GameMaker 1.4 ships games as a single IFF container (`FORM ... data.win`)
+holding every asset and all logic already lowered to GameMaker bytecode. gm14
+parses that container, decodes the bytecode, and executes it in a small virtual
+machine — no recompilation, no GameMaker required.
+
+This repository is the **platform-agnostic core**: standard C++17 with **zero
+console or OS SDK headers**. The Nintendo 3DS back-end lives in `gm14-3ds`, and
+is wired in there as a submodule at `tools/gm14/core`.
+
+## Features
+
+- **Full `data.win` parser** — every IFF chunk: `GEN8`, `STRG`, `TXTR`, `TPAG`,
+  `SPRT`, `BGND`, `OBJT`, `ROOM`, `CODE`, `VARI`, `FUNC`, and the rest.
+- **Bytecode VM** — stack machine for bytecode v15/16 with variables, arrays,
+  scripts, instance/room lifecycle, alarms, persistence and ~130 builtins.
+- **Reference-chain resolution** — decodes the `VARI`/`FUNC` pointer chains and
+  resolves string literals to `STRG` indices.
+- **Static room renderer** — composites backgrounds, tiles and sprites to an RGBA
+  framebuffer (PNG output for the host driver).
+- **Portable by construction** — builds on Linux/macOS/Windows with only a C++17
+  compiler; no console SDK, no engine dependency.
+
+Verified against **Undertale 1.0.0.1539** (bytecode v16):
+
+```
+code entries      : 6272
+instructions      : 891526
+variables/functions: 10899 / 427
+resolved var/fn refs: 206598 / 78929
+sprites/objects/rooms: 2583 / 1709 / 336
+```
 
 ## Contents
 
@@ -14,8 +42,8 @@ console SDK headers. The Nintendo 3DS front-end lives in `gm14-3ds`.
 |---|---|
 | `dw.cpp` / `dw.hpp` | `data.win` IFF chunk parser, asset decode, room compositor |
 | `vm.cpp` / `vm.hpp` | Bytecode VM, opcode executor, instance pool |
-| `main_host.cpp` | PC host driver: parse a `data.win`, print stats, render rooms to PNG |
-| `vm_host.cpp` | Headless VM driver (run a room for N frames, save frames) |
+| `main_host.cpp` | PC driver: parse a `data.win`, print stats, render rooms to PNG |
+| `vm_host.cpp` | Headless VM driver: run a room for N frames, dump a frame |
 | `stb_image.h` / `stb_image_write.h` | Single-header image I/O |
 | `Makefile.host` | g++/clang++ build for Linux/macOS |
 
@@ -23,9 +51,9 @@ console SDK headers. The Nintendo 3DS front-end lives in `gm14-3ds`.
 
 ```bash
 make -f Makefile.host
-./gm14_host path/to/data.win            # print stats
-./gm14_host path/to/data.win 6 4        # render room #6 and #4 -> out_room_*.png
-./vm_host  path/to/data.win 6 120       # run room #6 for 120 frames
+./gm14_host path/to/data.win            # print parser stats
+./gm14_host path/to/data.win 6 4        # render rooms #6 and #4 -> out_room_*.png
+./vm_host   path/to/data.win 6 120      # run room #6 for 120 frames
 ```
 
 ## Format notes
@@ -41,6 +69,11 @@ make -f Makefile.host
 * Array access pushes `value`, `instance_type`, `index` before `pop array`
   (and `instance_type`, `index` before `push array`).
 * `TXTR` blobs are 0x80-aligned raw PNGs; size = next blob start − this start.
+
+## Related
+
+- **[gm14-3ds](https://github.com/Dxrmy/gm14-3ds)** — Nintendo 3DS front-end
+  (citro3d/citro2d, hid input, ndsp audio) that consumes this core.
 
 ## License
 
