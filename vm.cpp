@@ -1,4 +1,4 @@
-#include "vm.hpp"
+﻿#include "vm.hpp"
 #include <cmath>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -57,6 +57,50 @@ Runtime::Runtime(DataWin& dw_) : dw(dw_) {
     register_builtins();
 }
 
+// ---------------- audio helpers ----------------
+void Runtime::ensure_audio() {
+    if (!audio) {
+        audio.reset(new AudioEngine());
+#ifdef __3DS__
+        // On hardware, route the mixer into the Teak DSP. Tests and the host
+        // keep the deterministic null backend unless a backend is set explicitly.
+        audio->set_backend(make_device_backend());
+#endif
+        // Lazy per-sound decoding with a bounded PCM budget. Decoding all 442
+        // Undertale sounds eagerly needs tens of MB and exhausts the 3DS heap
+        // (manifested as std::bad_alloc in step()). Clips are decoded on first
+        // use and LRU-evicted when the budget is exceeded.
+        DataWin* dwp = &dw;
+        audio->set_clip_loader([dwp](int asset) -> std::shared_ptr<AudioClip> {
+            if (asset < 0 || asset >= (int)dwp->sounds.size()) return nullptr;
+            const Sound& s = dwp->sounds[asset];
+            if (s.audo_id < 0 || s.audo_id >= (int)dwp->audio.size()) return nullptr;
+            std::vector<uint8_t> bytes = dwp->audio_bytes(s.audo_id);
+            if (bytes.empty()) return nullptr;
+            std::shared_ptr<AudioClip> clip = std::make_shared<AudioClip>();
+            if (!decode_audio(bytes.data(), bytes.size(), *clip)) return nullptr;
+            return clip;
+        }, 6u * 1024u * 1024u);  // ~6 MB PCM budget
+    }
+}
+
+// A GML sound argument is either an asset index (0-based SOND index) or a
+// play handle (>= kHandleBase). Return the asset index it refers to.
+int Runtime::audio_asset_index(const Value& v) const {
+    int id = (int)to_num(v);
+    if (id >= kHandleBase) {
+        // handled by the engine as a voice handle; caller decides.
+        return id;
+    }
+    return id;
+}
+
+void Runtime::audio_register_clips() {
+    // Lazy loading: the engine decodes clips on demand via the loader set in
+    // ensure_audio(). This function only guarantees the engine exists.
+    ensure_audio();
+}
+
 static bool is_obj(const DataWin& dw, Instance* inst, int target) {
     if (!inst) return false;
     int o = inst->obj;
@@ -69,7 +113,7 @@ static bool is_obj(const DataWin& dw, Instance* inst, int target) {
 }
 
 Instance* Runtime::resolve_inst(int inst_type) {
-    if (inst_type == -1 || inst_type == 0) return cur;
+    if (inst_type == -1) return cur;
     if (inst_type == -2) return other;
     if (inst_type >= 100000) {
         for (auto& i : instances) if (i->alive && i->iid == inst_type) return i.get();
@@ -82,6 +126,9 @@ Instance* Runtime::resolve_inst(int inst_type) {
 // ---------------- variables ----------------
 Value Runtime::get_var(Frame& fr, const Instruction& ins) {
     int inst_type = (int)(int16_t)ins.low16();
+    if (inst_type == -9 || ins.ref_type() == 0x80) {
+        if (!fr.stack.empty()) { inst_type = (int)to_num(fr.stack.back()); fr.stack.pop_back(); }
+    }
     std::string name;
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
@@ -108,6 +155,12 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
     if (inst) {
         auto it = inst->vars.find(name);
         if (it != inst->vars.end()) return it->second;
+        // If this name has array contents (e.g. `charmap` built as an array),
+        // expose them so string/draw builtins can index via the value.
+        auto ai = inst->arrays.find(name);
+        if (ai != inst->arrays.end() && !ai->second.empty()) {
+            Value v; v.type = Value::VARPTR; v.arrref = &ai->second; return v;
+        }
     }
     // builtin instance variables default
     static const std::unordered_map<std::string, double> defs = {
@@ -135,6 +188,9 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
 
 void Runtime::set_var(Frame& fr, const Instruction& ins, const Value& v) {
     int inst_type = (int)(int16_t)ins.low16();
+    if (inst_type == -9 || ins.ref_type() == 0x80) {
+        if (!fr.stack.empty()) { inst_type = (int)to_num(fr.stack.back()); fr.stack.pop_back(); }
+    }
     std::string name;
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
@@ -156,6 +212,9 @@ void Runtime::set_var(Frame& fr, const Instruction& ins, const Value& v) {
 }
 
 Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int index) {
+    if (inst_type == -9 || ins.ref_type() == 0x80) {
+        if (!fr.stack.empty()) { inst_type = (int)to_num(fr.stack.back()); fr.stack.pop_back(); }
+    }
     std::string name;
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     if (name.compare(0, 5, "view_") == 0) {
@@ -194,6 +253,9 @@ Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int i
 }
 
 void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int index, const Value& v) {
+    if (inst_type == -9 || ins.ref_type() == 0x80) {
+        if (!fr.stack.empty()) { inst_type = (int)to_num(fr.stack.back()); fr.stack.pop_back(); }
+    }
     std::string name;
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     if (name.compare(0, 5, "view_") == 0) {
@@ -233,11 +295,32 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
 
 // ---------------- execution ----------------
 Value Runtime::call(const std::string& name, std::vector<Value>& args) {
-    auto b = builtins.find(name);
-    if (b != builtins.end()) return b->second(*this, args);
+    if (diag_sink) {
+        std::string line = "call " + name + " argc=" + std::to_string(args.size());
+        for (size_t i = 0; i < args.size() && i < 6; ++i) {
+            line += " ";
+            if (args[i].is_str()) line += "\"" + args[i].str + "\"";
+            else line += std::to_string((long long)args[i].num);
+        }
+        diag_sink(line.c_str());
+    }
+    // GMS resolution order: a user script with the same name as a builtin
+    // SHADOWS the builtin. This matters for Undertale, which defines its own
+    // control_* / draw_* etc. scripts. Check scripts first.
     auto s = scripts.find(name);
     if (s != scripts.end()) return run_entry(s->second, args, cur, other);
-    warned.insert(name);
+    auto b = builtins.find(name);
+    if (b != builtins.end()) return b->second(*this, args);
+    // Unknown function: log once, record it, pop nothing extra (args are already
+    // consumed by the caller), and push a default real 0.0 so the game keeps
+    // running instead of crashing.
+    if (warned.insert(name).second) {
+        std::printf("[VM UNIMPLEMENTED] Function: %s (argc=%d) | IP: 0x%08X\n",
+                    name.c_str(), (int)args.size(), (unsigned)frame_count);
+        std::fflush(stdout);
+        m_unimplemented.push_back(name);
+    }
+    if (diag_sink) { std::string l = "UNIMPLEMENTED " + name; diag_sink(l.c_str()); }
     return Value(0.0);
 }
 
@@ -276,14 +359,22 @@ void Runtime::exec(Frame& fr) {
         if (++steps > budget) throw std::runtime_error("instruction budget exceeded in " + fr.entry->name);
         const Instruction& ins = ins_list[fr.pc];
         uint8_t k = ins.kind(), t1 = ins.type1();
+        // Safe stack pop: GML bytecode occasionally under-flows on unusual paths
+        // (malformed branch targets, missing event setup). Popping an empty stack
+        // is undefined behaviour and manifests as a segfault or bad_alloc, so we
+        // substitute 0.0 instead of crashing. See HANDOFF.md.
+        auto stk_pop = [&]() -> Value {
+            if (fr.stack.empty()) { if (diag_sink) diag_sink("STACK_UNDERFLOW"); return Value(0.0); }
+            Value v = fr.stack.back(); fr.stack.pop_back(); return v;
+        };
         auto is_push = [](uint8_t kk){ return kk==OP_PUSH||kk==OP_PUSHLOC||kk==OP_PUSHGLB||kk==OP_PUSHBLTN||kk==OP_PUSHI; };
         if (is_push(k)) {
             if (t1 == 0x0F) fr.stack.push_back(Value(ins.value));
             else if (t1 == 6) { uint32_t idx = ins.str_index(); fr.stack.push_back(Value(idx < dw.strings.size() ? dw.strings[idx] : std::string())); }
             else if (ins.var >= 0) {
                 if (ins.ref_type() == 0x00) {
-                    int idx = (int)to_num(fr.stack.back()); fr.stack.pop_back();
-                    int it = (int)to_num(fr.stack.back()); fr.stack.pop_back();
+                    int idx = (int)to_num(stk_pop());
+                    int it = (int)to_num(stk_pop());
                     fr.stack.push_back(get_array(fr, ins, it, idx));
                 } else fr.stack.push_back(get_var(fr, ins));
             } else if (ins.fun >= 0) fr.stack.push_back(Value(dw.functions[ins.fun].name));
@@ -293,12 +384,12 @@ void Runtime::exec(Frame& fr) {
             if (t1 == 0x0F) {
                 if (fr.stack.size() >= 2) std::swap(fr.stack[fr.stack.size()-1], fr.stack[fr.stack.size()-2]);
             } else if (ins.var >= 0 && ins.ref_type() == 0x00) {
-                int idx = (int)to_num(fr.stack.back()); fr.stack.pop_back();
-                int it = (int)to_num(fr.stack.back()); fr.stack.pop_back();
-                Value v = fr.stack.back(); fr.stack.pop_back();
+                int idx = (int)to_num(stk_pop());
+                int it = (int)to_num(stk_pop());
+                Value v = stk_pop();
                 set_array(fr, ins, it, idx, v);
             } else {
-                Value v = fr.stack.back(); fr.stack.pop_back();
+                Value v = stk_pop();
                 set_var(fr, ins, v);
             }
             fr.pc++;
@@ -307,7 +398,7 @@ void Runtime::exec(Frame& fr) {
         } else if (k == OP_DUP) {
             if (!fr.stack.empty()) fr.stack.push_back(fr.stack.back()); fr.pc++;
         } else if (k == OP_CONV) {
-            Value v = fr.stack.back(); fr.stack.pop_back();
+            Value v = stk_pop();
             uint8_t dst = ins.type2();
             if (dst == 5) { /* GML variant: preserve value type */ }
             else if (dst == 2 || dst == 3 || dst == 0x0F) v = Value((double)(long long)to_num(v));
@@ -316,15 +407,15 @@ void Runtime::exec(Frame& fr) {
             else v = Value(to_num(v));
             fr.stack.push_back(v); fr.pc++;
         } else if (k == OP_ADD) {
-            Value b = fr.stack.back(); fr.stack.pop_back();
-            Value a = fr.stack.back(); fr.stack.pop_back();
+            Value b = stk_pop();
+            Value a = stk_pop();
             if (a.is_str() || b.is_str()) fr.stack.push_back(Value(to_str(a) + to_str(b)));
             else fr.stack.push_back(Value(to_num(a) + to_num(b)));
             fr.pc++;
         } else if (k == OP_SUB || k == OP_MUL || k == OP_DIV || k == OP_REM || k == OP_MOD ||
                    k == OP_AND || k == OP_OR || k == OP_XOR || k == OP_SHL || k == OP_SHR) {
-            Value b = fr.stack.back(); fr.stack.pop_back();
-            Value a = fr.stack.back(); fr.stack.pop_back();
+            Value b = stk_pop();
+            Value a = stk_pop();
             double x = to_num(a), y = to_num(b), r = 0;
             switch (k) {
                 case OP_SUB: r = x - y; break;
@@ -339,12 +430,15 @@ void Runtime::exec(Frame& fr) {
             }
             fr.stack.push_back(Value(r)); fr.pc++;
         } else if (k == OP_NEG) {
-            Value v = fr.stack.back(); fr.stack.pop_back(); fr.stack.push_back(Value(-to_num(v))); fr.pc++;
+            Value v = stk_pop(); fr.stack.push_back(Value(-to_num(v))); fr.pc++;
         } else if (k == OP_NOT) {
-            Value v = fr.stack.back(); fr.stack.pop_back(); fr.stack.push_back(Value(to_num(v) == 0 ? 1.0 : 0.0)); fr.pc++;
+            Value v = stk_pop();
+            if (t1 == 4) fr.stack.push_back(Value(!to_bool(v) ? 1.0 : 0.0));
+            else fr.stack.push_back(Value((double)(~(long long)to_num(v))));
+            fr.pc++;
         } else if (k == OP_CMP) {
-            Value b = fr.stack.back(); fr.stack.pop_back();
-            Value a = fr.stack.back(); fr.stack.pop_back();
+            Value b = stk_pop();
+            Value a = stk_pop();
             bool r;
             if (a.is_str() || b.is_str()) {
                 int c = to_str(a).compare(to_str(b));
@@ -358,17 +452,22 @@ void Runtime::exec(Frame& fr) {
             fr.stack.push_back(Value(r ? 1.0 : 0.0)); fr.pc++;
         } else if (k == OP_B || k == OP_BT || k == OP_BF) {
             bool take = true;
-            if (k != OP_B) { bool c = to_bool(fr.stack.back()); fr.stack.pop_back(); take = (k == OP_BT) ? c : !c; }
+            Value bval = fr.stack.empty() ? Value(0.0) : fr.stack.back();
+            if (k != OP_B) { bool c = to_bool(stk_pop()); take = (k == OP_BT) ? c : !c; }
+            if (diag_sink && fr.entry && fr.entry->name=="gml_Script_scr_namingscreen" && fr.pc>=378 && fr.pc<=420) {
+                std::string l="BR pc="+std::to_string(fr.pc)+" k=0x"+std::to_string((int)k)+" top="+std::to_string((long long)to_num(bval))+" take="+std::to_string((int)take)+" stack="+std::to_string(fr.stack.size());
+                diag_sink(l.c_str());
+            }
             if (take) {
                 int target = (int)(fr.addrs[fr.pc] + jump_offset(ins));
                 auto it = fr.addr_index.find(target);
                 fr.pc = (it != fr.addr_index.end()) ? it->second : n;
             } else fr.pc++;
         } else if (k == OP_PUSHENV) {
-            Value v = fr.stack.back(); fr.stack.pop_back();
+            Value v = stk_pop();
             int target_id = (int)to_num(v);
             std::vector<Instance*> targets;
-            if (target_id == -1 || target_id == 0) {
+            if (target_id == -1) {
                 if (cur && cur->alive) targets.push_back(cur);
             } else if (target_id == -2) {
                 if (other && other->alive) targets.push_back(other);
@@ -417,7 +516,7 @@ void Runtime::exec(Frame& fr) {
         } else if (k == OP_CALL) {
             int argc = ins.low16();
             std::vector<Value> args(argc);
-            for (int i = 0; i < argc; ++i) { args[i] = fr.stack.back(); fr.stack.pop_back(); }
+            for (int i = 0; i < argc; ++i) { args[i] = stk_pop(); }
             std::string name = (ins.fun >= 0 && ins.fun < (int)dw.functions.size()) ? dw.functions[ins.fun].name : "";
             fr.stack.push_back(call(name, args));
             fr.pc++;
@@ -431,8 +530,8 @@ void Runtime::exec(Frame& fr) {
         } else if (k == OP_CALLV) {
             int argc = ins.low16();
             std::vector<Value> args(argc);
-            for (int i = 0; i < argc; ++i) { args[i] = fr.stack.back(); fr.stack.pop_back(); }
-            Value fn = fr.stack.back(); fr.stack.pop_back();
+            for (int i = 0; i < argc; ++i) { args[i] = stk_pop(); }
+            Value fn = stk_pop();
             fr.stack.push_back(fn.is_str() ? call(fn.str, args) : Value(0.0));
             fr.pc++;
         } else {
@@ -512,6 +611,62 @@ void Runtime::blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, 
     }
 }
 
+void Runtime::blit_sub_screen_scaled(const Image& src, int sx, int sy, int sw, int sh,
+                                     int dx, int dy, int out_w, int out_h,
+                                     double alpha, uint32_t color, double angle_deg) {
+    if (!screen || sw <= 0 || sh <= 0 || src.w <= 0 || src.h <= 0) return;
+    if (out_w <= 0 || out_h <= 0) return;
+    int a255 = (int)(std::max(0.0, std::min(1.0, alpha)) * 255);
+    if (a255 <= 0) return;
+    uint8_t tr = (uint8_t)(color & 0xFF);
+    uint8_t tg = (uint8_t)((color >> 8) & 0xFF);
+    uint8_t tb = (uint8_t)((color >> 16) & 0xFF);
+    double ang = angle_deg * 3.14159265358979 / 180.0;
+    double ca = std::cos(ang), sa = std::sin(ang);
+    // Centre of the destination rect (rotation pivot).
+    double cx = dx + out_w * 0.5;
+    double cy = dy + out_h * 0.5;
+    // Bounding box of the rotated rect so we know which dest pixels to visit.
+    double hw = out_w * 0.5, hh = out_h * 0.5;
+    int bb_w = (int)std::ceil(std::abs(out_w * ca) + std::abs(out_h * sa)) + 2;
+    int bb_h = (int)std::ceil(std::abs(out_w * sa) + std::abs(out_h * ca)) + 2;
+    int bb_x = (int)(cx - bb_w * 0.5);
+    int bb_y = (int)(cy - bb_h * 0.5);
+    for (int py = 0; py < bb_h; ++py) {
+        int ty = bb_y + py; if (ty < 0 || ty >= screen->h) continue;
+        for (int px = 0; px < bb_w; ++px) {
+            int tx = bb_x + px; if (tx < 0 || tx >= screen->w) continue;
+            // Inverse-rotate the dest point into the unrotated dest rect space.
+            double rx = (tx + 0.5) - cx;
+            double ry = (ty + 0.5) - cy;
+            double ux = rx * ca + ry * sa;   // -hw..hw
+            double uy = -rx * sa + ry * ca;  // -hh..hh
+            if (ux < -hw || ux >= hw || uy < -hh || uy >= hh) continue;
+            // Map into source sub-rect.
+            double fx = (ux + hw) / (double)out_w;   // 0..1
+            double fy = (uy + hh) / (double)out_h;   // 0..1
+            int ssx = sx + (int)(fx * sw);
+            int ssy = sy + (int)(fy * sh);
+            if (ssx < 0 || ssx >= src.w || ssy < 0 || ssy >= src.h) continue;
+            const uint8_t* s = &src.rgba[((size_t)ssy * src.w + ssx) * 4];
+            if (s[3] == 0) continue;
+            uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
+            uint8_t sr = (uint8_t)((s[0] * tr) / 255);
+            uint8_t sg = (uint8_t)((s[1] * tg) / 255);
+            uint8_t sb = (uint8_t)((s[2] * tb) / 255);
+            if (s[3] == 255 && a255 == 255) {
+                d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
+            } else {
+                double sfa = (s[3] / 255.0) * (a255 / 255.0);
+                d[0] = (uint8_t)std::min(255.0, sr * sfa + d[0] * (1.0 - sfa));
+                d[1] = (uint8_t)std::min(255.0, sg * sfa + d[1] * (1.0 - sfa));
+                d[2] = (uint8_t)std::min(255.0, sb * sfa + d[2] * (1.0 - sfa));
+                d[3] = 255;
+            }
+        }
+    }
+}
+
 void Runtime::blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int sh,
                                   int dx, int dy, double alpha, uint32_t color) {
     if (!screen || sw <= 0 || sh <= 0 || src.w <= 0 || src.h <= 0) return;
@@ -562,9 +717,36 @@ static void draw_sprite_impl(Runtime& rt, double sprite, double subimg, double x
     if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return;
     const Image& pg = rt.page(t.tex);
     if (pg.w <= 0 || t.sx < 0 || t.sy < 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return;
-    int dx = (int)(x - sp.origin_x) + t.tx - rt.view_x;
-    int dy = (int)(y - sp.origin_y) + t.ty - rt.view_y;
-    rt.blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, alpha);
+    // Destination top-left in screen space (origin-relative).
+    int dx = (int)std::lround(x - sp.origin_x * xs) + t.tx - rt.view_x;
+    int dy = (int)std::lround(y - sp.origin_y * ys) + t.ty - rt.view_y;
+    int out_w = (int)std::lround(t.sw * xs);
+    int out_h = (int)std::lround(t.sh * ys);
+    if (out_w == t.sw && out_h == t.sh) {
+        rt.blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, alpha);
+    } else {
+        rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, out_w, out_h, alpha, 0xFFFFFF, 0.0);
+    }
+}
+
+// Draw a sprite stretched to exactly (w,h) with top-left at (x,y).
+static void draw_sprite_stretched_impl(Runtime& rt, double sprite, double subimg,
+                                       double x, double y, double w, double h, double alpha) {
+    int si = (int)sprite;
+    if (si < 0 || si >= (int)rt.dw.sprites.size()) return;
+    const Sprite& sp = rt.dw.sprites[si];
+    if (sp.frames.empty()) return;
+    int n = (int)sp.frames.size();
+    int fi = ((int)subimg % n + n) % n;
+    int tpag_idx = sp.frames[fi];
+    if (tpag_idx < 0 || tpag_idx >= (int)rt.dw.tpags.size()) return;
+    const Tpag& t = rt.dw.tpags[tpag_idx];
+    if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return;
+    const Image& pg = rt.page(t.tex);
+    if (pg.w <= 0) return;
+    rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh,
+                              (int)std::lround(x) - rt.view_x, (int)std::lround(y) - rt.view_y,
+                              (int)std::lround(w), (int)std::lround(h), alpha, 0xFFFFFF, 0.0);
 }
 
 // ---------------- builtins ----------------
@@ -580,9 +762,19 @@ static bool bbox_of(Runtime& rt, Instance* inst, double x, double y, double* bb)
     if (sprite < 0) sprite = v.count("sprite_index") ? (int)to_num(v["sprite_index"]) : -1;
     if (sprite < 0 || sprite >= (int)rt.dw.sprites.size()) return false;
     const Sprite& s = rt.dw.sprites[sprite];
-    bb[0] = x - s.origin_x; bb[1] = y - s.origin_y;
-    bb[2] = bb[0] + (double)std::max<uint32_t>(1, s.width) - 1;
-    bb[3] = bb[1] + (double)std::max<uint32_t>(1, s.height) - 1;
+    double xs = v.count("image_xscale") ? to_num(v["image_xscale"]) : 1.0;
+    double ys = v.count("image_yscale") ? to_num(v["image_yscale"]) : 1.0;
+    double l = s.ml, r = s.mr, t = s.mt, b = s.mb;
+    if (r <= l) r = (double)std::max<uint32_t>(1, s.width) - 1;
+    if (b <= t) b = (double)std::max<uint32_t>(1, s.height) - 1;
+    double x0 = (l - s.origin_x) * xs;
+    double x1 = (r - s.origin_x) * xs;
+    double y0 = (t - s.origin_y) * ys;
+    double y1 = (b - s.origin_y) * ys;
+    if (x0 > x1) std::swap(x0, x1);
+    if (y0 > y1) std::swap(y0, y1);
+    bb[0] = x + x0; bb[1] = y + y0;
+    bb[2] = x + x1; bb[3] = y + y1;
     return true;
 }
 static bool overlap(const double* a, const double* b) {
@@ -624,6 +816,13 @@ void Runtime::register_builtins() {
     builtins["draw_sprite_ext"] = [](Runtime& rt, std::vector<Value>& a){
         draw_sprite_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), narg(a,4), narg(a,5),
                          a.size()>7?narg(a,7):1); return vnum(0); };
+    builtins["draw_sprite_stretched"] = [](Runtime& rt, std::vector<Value>& a){
+        draw_sprite_stretched_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), narg(a,4), narg(a,5), 1.0);
+        return vnum(0); };
+    builtins["draw_sprite_stretched_ext"] = [](Runtime& rt, std::vector<Value>& a){
+        draw_sprite_stretched_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), narg(a,4), narg(a,5),
+                                   a.size()>7?narg(a,7):1.0);
+        return vnum(0); };
     builtins["draw_self"] = [](Runtime& rt, std::vector<Value>&){
         if (!rt.cur) return vnum(0);
         auto& v = rt.cur->vars;
@@ -637,13 +836,26 @@ void Runtime::register_builtins() {
     builtins["draw_set_color"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_color=(int)narg(a,0); return vnum(0); };
     builtins["draw_set_colour"] = builtins["draw_set_color"];
     builtins["draw_set_alpha"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_alpha=narg(a,0); return vnum(0); };
-    auto render_text_fn = [](Runtime& rt, std::vector<Value>& a, int color_arg_idx, int alpha_arg_idx) {
+    // Render text with optional scale/rotation. Arg layout follows GML:
+    //   draw_text(x, y, str)
+    //   draw_text_transformed(x, y, str, xscale, yscale, angle)
+    //   draw_text_ext(x, y, str, sep, w)
+    //   ..._color variants append c1..c4(, alpha...)
+    // We look up optional scale/angle by fixed indices passed in.
+    auto render_text_fn = [](Runtime& rt, std::vector<Value>& a,
+                             int color_arg_idx, int alpha_arg_idx,
+                             int xscale_idx, int yscale_idx, int angle_idx) {
         if (a.size() < 3) return vnum(0);
         std::string txt = to_str(a[2]);
         if (txt.empty() || txt == "undefined") return vnum(0);
         double x0 = to_num(a[0]), y0 = to_num(a[1]);
         uint32_t col = (color_arg_idx >= 0 && (int)a.size() > color_arg_idx) ? (uint32_t)to_num(a[color_arg_idx]) : rt.draw_color;
         double alp = (alpha_arg_idx >= 0 && (int)a.size() > alpha_arg_idx) ? to_num(a[alpha_arg_idx]) : rt.draw_alpha;
+        double xscale = (xscale_idx >= 0 && (int)a.size() > xscale_idx) ? to_num(a[xscale_idx]) : 1.0;
+        double yscale = (yscale_idx >= 0 && (int)a.size() > yscale_idx) ? to_num(a[yscale_idx]) : 1.0;
+        double angle  = (angle_idx  >= 0 && (int)a.size() > angle_idx)  ? to_num(a[angle_idx])  : 0.0;
+        if (xscale == 0.0) xscale = 1.0;
+        if (yscale == 0.0) yscale = 1.0;
 
         int fi = rt.draw_font;
         if (fi < 0 && rt.dw.fonts.size() > 1) fi = 1;
@@ -654,22 +866,35 @@ void Runtime::register_builtins() {
                 const Tpag& t = rt.dw.tpags[f.tpag];
                 if (t.tex >= 0 && t.tex < (int)rt.dw.tex_ptrs.size()) {
                     const Image& pg = rt.page(t.tex);
+                    bool transformed = (xscale != 1.0 || yscale != 1.0 || angle != 0.0);
                     double x = x0, y = y0;
                     for (char c : txt) {
-                        if (c == '\n') { x = x0; y += std::max<uint32_t>(1, f.em); continue; }
+                        if (c == '\n') { x = x0; y += std::max<uint32_t>(1, f.em) * yscale; continue; }
                         auto g = f.glyphs.find((uint8_t)c);
                         if (g == f.glyphs.end()) g = f.glyphs.find((uint16_t)63);
-                        if (g == f.glyphs.end()) { x += 8; continue; }
+                        if (g == f.glyphs.end()) { x += 8 * xscale; continue; }
                         const Glyph& gl = g->second;
                         int g_sx = t.sx + gl.sx;
                         int g_sy = t.sy + gl.sy;
                         if (gl.sw > 0 && gl.sh > 0 && g_sx + gl.sw <= pg.w && g_sy + gl.sh <= pg.h) {
-                            rt.blit_sub_screen_tint(pg, g_sx, g_sy, gl.sw, gl.sh,
-                                                   (int)(x + gl.offset) - rt.view_x,
-                                                   (int)y - rt.view_y,
-                                                   alp, col);
+                            int base_dx = (int)std::lround(x + gl.offset * xscale) - rt.view_x;
+                            int base_dy = (int)std::lround(y) - rt.view_y;
+                            if (!transformed) {
+                                rt.blit_sub_screen_tint(pg, g_sx, g_sy, gl.sw, gl.sh, base_dx, base_dy, alp, col);
+                            } else {
+                                int ow = (int)std::lround(gl.sw * xscale);
+                                int oh = (int)std::lround(gl.sh * yscale);
+                                // Rotate each glyph about the text origin (x0,y0) so the
+                                // whole string stays coherent under one angle.
+                                double ang = angle * 3.14159265358979 / 180.0;
+                                double rx = (base_dx + rt.view_x) - x0;
+                                double ry = (base_dy + rt.view_y) - y0;
+                                int gx = (int)std::lround(x0 + rx * std::cos(ang) - ry * std::sin(ang)) - rt.view_x;
+                                int gy = (int)std::lround(y0 + rx * std::sin(ang) + ry * std::cos(ang)) - rt.view_y;
+                                rt.blit_sub_screen_scaled(pg, g_sx, g_sy, gl.sw, gl.sh, gx, gy, ow, oh, alp, col, angle);
+                            }
                         }
-                        x += gl.shift;
+                        x += gl.shift * xscale;
                     }
                     return vnum(0);
                 }
@@ -678,18 +903,18 @@ void Runtime::register_builtins() {
         return vnum(0);
     };
 
-    builtins["draw_text"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1); };
-    builtins["draw_text_transformed"] = builtins["draw_text"];
-    builtins["draw_text_ext"] = builtins["draw_text"];
-    builtins["draw_text_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 3, 7); };
+    builtins["draw_text"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, -1, -1, -1); };
+    builtins["draw_text_transformed"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, 3, 4, 5); };
+    builtins["draw_text_ext"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, -1, -1, -1); };
+    builtins["draw_text_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 3, 7, -1, -1, -1); };
     builtins["draw_text_colour"] = builtins["draw_text_color"];
-    builtins["draw_text_transformed_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 6, 10); };
+    builtins["draw_text_transformed_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 6, 10, 3, 4, 5); };
     builtins["draw_text_transformed_colour"] = builtins["draw_text_transformed_color"];
-    builtins["draw_text_ext_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 5, 9); };
+    builtins["draw_text_ext_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 5, 9, -1, -1, -1); };
     builtins["draw_text_ext_colour"] = builtins["draw_text_ext_color"];
-    builtins["draw_text_ext_transformed"] = builtins["draw_text"];
-    builtins["draw_text_ext_transformed_color"] = builtins["draw_text_transformed_color"];
-    builtins["draw_text_ext_transformed_colour"] = builtins["draw_text_transformed_color"];
+    builtins["draw_text_ext_transformed"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, 5, 6, 7); };
+    builtins["draw_text_ext_transformed_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 8, 12, 5, 6, 7); };
+    builtins["draw_text_ext_transformed_colour"] = builtins["draw_text_ext_transformed_color"];
 
     builtins["draw_rectangle"] = [](Runtime& rt, std::vector<Value>& a){
         if (!rt.screen || a.size() < 4) return vnum(0);
@@ -768,18 +993,24 @@ void Runtime::register_builtins() {
     builtins["instance_exists"] = [](Runtime& rt, std::vector<Value>& a){
         int v=(int)narg(a,0); for (auto& i:rt.instances) if (i->alive && (i->iid==v||i->obj==v)) return vnum(1); return vnum(0); };
     builtins["instance_destroy"] = [](Runtime& rt, std::vector<Value>& a){
+        auto kill = [&](Instance* inst) {
+            if (inst && inst->alive) {
+                rt.run_event(inst, 1, 0);
+                inst->alive = false;
+            }
+        };
         if (a.empty()) {
-            if (rt.cur) rt.cur->alive = false;
+            kill(rt.cur);
         } else {
             int target = (int)to_num(a[0]);
-            if (target == -1 || target == 0) {
-                if (rt.cur) rt.cur->alive = false;
+            if (target == -1) {
+                kill(rt.cur);
             } else if (target == -2) {
-                if (rt.other) rt.other->alive = false;
+                kill(rt.other);
             } else {
                 for (auto& inst : rt.instances) {
                     if (inst->alive && (inst->iid == target || is_obj(rt.dw, inst.get(), target))) {
-                        inst->alive = false;
+                        kill(inst.get());
                     }
                 }
             }
@@ -789,6 +1020,52 @@ void Runtime::register_builtins() {
     builtins["instance_find"] = [](Runtime& rt, std::vector<Value>& a){
         int obj=(int)narg(a,0), n=(int)narg(a,1); int c=0;
         for (auto& i:rt.instances) if (i->alive&&i->obj==obj){ if (c==n) return vnum(i->iid); c++; } return vnum(-4); };
+    builtins["instance_number"] = [](Runtime& rt, std::vector<Value>& a){
+        int obj = (int)narg(a,0);
+        if (obj == -1) { double c=0; for (auto& i:rt.instances) if (i->alive) c++; return vnum(c); }
+        if (obj == -3) { double c=0; for (auto& i:rt.instances) if (!i->alive) c++; return vnum(c); }
+        double c=0; for (auto& i:rt.instances) if (i->alive && is_obj(rt.dw, i.get(), obj)) c++;
+        return vnum(c); };
+    builtins["instance_create_depth"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() < 4) return vnum(-4);
+        double x = narg(a,0), y = narg(a,1), depth = narg(a,2);
+        int obj = (int)narg(a,3);
+        if (obj < 0 || obj >= (int)rt.dw.objects.size()) return vnum(-4);
+        auto inst = std::make_unique<Instance>(rt.next_iid++, obj);
+        inst->vars["x"] = vnum(x); inst->vars["y"] = vnum(y);
+        inst->vars["xstart"] = vnum(x); inst->vars["ystart"] = vnum(y);
+        inst->vars["image_xscale"] = vnum(1.0);
+        inst->vars["image_yscale"] = vnum(1.0);
+        inst->vars["image_angle"] = vnum(0.0);
+        inst->vars["image_alpha"] = vnum(1.0);
+        inst->vars["sprite_index"] = vnum(rt.dw.objects[obj].sprite);
+        inst->vars["depth"] = vnum(depth);
+        inst->vars["visible"] = vnum(rt.dw.objects[obj].visible ? 1 : 0);
+        inst->vars["solid"] = vnum(rt.dw.objects[obj].solid ? 1 : 0);
+        inst->vars["persistent"] = vnum(rt.dw.objects[obj].persistent ? 1 : 0);
+        inst->vars["object_index"] = vnum(obj);
+        inst->vars["id"] = vnum(inst->iid);
+        Instance* ip = inst.get();
+        rt.instances.push_back(std::move(inst));
+        rt.run_event(ip, 0, 0);
+        return vnum(ip->iid); };
+    builtins["instance_copy"] = [](Runtime& rt, std::vector<Value>& a){
+        bool perf = narg(a,0) != 0.0;
+        Instance* src = rt.cur;
+        if (a.size() >= 2) { int t=(int)narg(a,1); for (auto& i:rt.instances) if (i->alive && (i->iid==t || i->obj==t)) { src=i.get(); break; } }
+        if (!src) return vnum(-4);
+        auto inst = std::make_unique<Instance>(rt.next_iid++, src->obj);
+        inst->vars = src->vars; inst->arrays = src->arrays; inst->alarms = src->alarms;
+        inst->vars["id"] = vnum(inst->iid);
+        Instance* ip = inst.get();
+        rt.instances.push_back(std::move(inst));
+        if (perf) rt.run_event(ip, 0, 0);
+        return vnum(ip->iid); };
+    builtins["instance_exists"] = [](Runtime& rt, std::vector<Value>& a){
+        int v=(int)narg(a,0);
+        if (v == -1) { for (auto& i:rt.instances) if (i->alive) return vnum(1); return vnum(0); }
+        for (auto& i:rt.instances) if (i->alive && (i->iid==v||i->obj==v)) return vnum(1);
+        return vnum(0); };
 
     builtins["keyboard_check"] = [](Runtime& rt, std::vector<Value>& a){ return vnum(rt.keys_held.count((int)narg(a,0))?1:0); };
     builtins["keyboard_check_direct"] = builtins["keyboard_check"];
@@ -810,20 +1087,14 @@ void Runtime::register_builtins() {
         rt.keys_pressed.clear();
         return vnum(0);
     };
-    builtins["control_clear"] = [](Runtime& rt, std::vector<Value>& a){
-        if (a.empty()) {
-            rt.keys_pressed.clear();
-        } else {
-            int b = (int)to_num(a[0]);
-            if (b == 0) { rt.keys_pressed.erase(90); rt.keys_pressed.erase(13); }
-            else if (b == 1) { rt.keys_pressed.erase(88); rt.keys_pressed.erase(16); }
-            else if (b == 2) { rt.keys_pressed.erase(67); rt.keys_pressed.erase(17); }
-        }
-        return vnum(0);
-    };
     builtins["keyboard_key_press"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["keyboard_key_release"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
 
+    // NOTE: Undertale defines its own `control_init`/`control_update`/
+    // `control_check`/`control_check_pressed`/`control_clear` scripts (CODE
+    // 207-211). We must NOT shadow them with builtins, or the game's input
+    // state machine breaks (e.g. the intro fade triggers immediately).
+    // Runtime::call prefers scripts for these names.
     auto check_btn = [](const Runtime& rt, int btn, bool pressed) -> bool {
         const auto& set = pressed ? rt.keys_pressed : rt.keys_held;
         // 0 / gp_face1: Confirm (Z = 90, Enter = 13)
@@ -838,12 +1109,6 @@ void Runtime::register_builtins() {
         if (btn == 32783) return set.count(37) != 0; // left
         if (btn == 32784) return set.count(39) != 0; // right
         return false;
-    };
-    builtins["control_check_pressed"] = [check_btn](Runtime& rt, std::vector<Value>& a){
-        return vnum(check_btn(rt, (int)narg(a,0), true) ? 1 : 0);
-    };
-    builtins["control_check"] = [check_btn](Runtime& rt, std::vector<Value>& a){
-        return vnum(check_btn(rt, (int)narg(a,0), false) ? 1 : 0);
     };
     builtins["gamepad_button_check"] = [check_btn](Runtime& rt, std::vector<Value>& a){
         int btn = (int)(a.size() > 1 ? narg(a,1) : narg(a,0));
@@ -918,7 +1183,16 @@ void Runtime::register_builtins() {
     builtins["string"] = [](Runtime&, std::vector<Value>& a){ return Value(a.empty()?std::string():to_str(a[0])); };
     builtins["real"] = [](Runtime&, std::vector<Value>& a){ return vnum(narg(a,0)); };
     builtins["string_length"] = [](Runtime&, std::vector<Value>& a){ return vnum((double)sarg(a,0).size()); };
-    builtins["string_char_at"] = [](Runtime&, std::vector<Value>& a){ std::string s=sarg(a,0); int i=(int)narg(a,1); return Value((i>=1&&i<=(int)s.size())?std::string(1,s[i-1]):std::string()); };
+    builtins["string_char_at"] = [](Runtime&, std::vector<Value>& a){
+        int i=(int)narg(a,1);
+        if (!a.empty() && a[0].is_arr()) {
+            const std::vector<Value>& arr = *a[0].arrref;
+            if (i>=0 && i<(int)arr.size()) return arr[i];
+            if (i>=1 && i-1<(int)arr.size()) return arr[i-1];
+            return Value(std::string(""));
+        }
+        std::string s=sarg(a,0);
+        return Value((i>=1&&i<=(int)s.size())?std::string(1,s[i-1]):std::string()); };
     builtins["string_copy"] = [](Runtime&, std::vector<Value>& a){ std::string s=sarg(a,0); int i=(int)narg(a,1), n=(int)narg(a,2); if(i<1)i=1; return Value(s.substr(std::min((int)s.size(),i-1), n)); };
     builtins["substr"] = [](Runtime&, std::vector<Value>& a){ std::string s=sarg(a,0); int i=(int)narg(a,1); if(i<1)i=1; if(a.size()>=3) return Value(s.substr(std::min((int)s.size(),i-1), std::max(0,(int)narg(a,2)))); return Value(s.substr(std::min((int)s.size(),i-1))); };
     builtins["string_upper"] = [](Runtime&, std::vector<Value>& a){ std::string s=sarg(a,0); for(auto&c:s)c=(char)std::toupper((unsigned char)c); return Value(s); };
@@ -930,6 +1204,13 @@ void Runtime::register_builtins() {
     builtins["chr"] = [](Runtime&, std::vector<Value>& a){ return Value(std::string(1,(char)(int)narg(a,0))); };
     builtins["is_undefined"] = [](Runtime&, std::vector<Value>& a){ return vnum((!a.empty() && a[0].type == Value::UNDEF) ? 1.0 : 0.0); };
     builtins["is_string"] = [](Runtime&, std::vector<Value>& a){ return vnum(a.size()&&a[0].is_str()?1:0); };
+    builtins["is_real"] = [](Runtime&, std::vector<Value>& a){ return vnum((!a.empty() && a[0].is_num()) ? 1.0 : 0.0); };
+    builtins["is_numeric"] = [](Runtime&, std::vector<Value>& a){ return vnum((!a.empty() && a[0].is_num()) ? 1.0 : 0.0); };
+    builtins["is_bool"] = [](Runtime&, std::vector<Value>& a){
+        if (a.empty()) return vnum(0);
+        return vnum((a[0].is_num() && (a[0].num == 0.0 || a[0].num == 1.0)) ? 1.0 : 0.0); };
+    builtins["is_array"] = [](Runtime&, std::vector<Value>&){ return vnum(0.0); };
+    builtins["is_method"] = [](Runtime&, std::vector<Value>&){ return vnum(0.0); };
 
     builtins["abs"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::fabs(narg(a,0))); };
     builtins["sign"] = [](Runtime&, std::vector<Value>& a){ double v=narg(a,0); return vnum(v>0?1:(v<0?-1:0)); };
@@ -939,11 +1220,29 @@ void Runtime::register_builtins() {
     builtins["sqrt"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::sqrt(narg(a,0))); };
     builtins["sin"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::sin(narg(a,0))); };
     builtins["cos"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::cos(narg(a,0))); };
+    builtins["tan"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::tan(narg(a,0))); };
+    builtins["arctan"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::atan(narg(a,0))); };
+    builtins["arcsin"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::asin(narg(a,0))); };
+    builtins["arccos"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::acos(narg(a,0))); };
+    builtins["arctan2"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::atan2(narg(a,0), narg(a,1))); };
+    builtins["radtodeg"] = [](Runtime&, std::vector<Value>& a){ return vnum(narg(a,0) * 180.0 / M_PI); };
+    builtins["dot_product"] = [](Runtime&, std::vector<Value>& a){ return vnum(narg(a,0)*narg(a,2) + narg(a,1)*narg(a,3)); };
     builtins["min"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::min(narg(a,0),narg(a,1))); };
     builtins["max"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::max(narg(a,0),narg(a,1))); };
     builtins["clamp"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::max(narg(a,1),std::min(narg(a,2),narg(a,0)))); };
     builtins["random"] = [](Runtime&, std::vector<Value>& a){ return vnum((double)std::rand()/RAND_MAX*narg(a,0)); };
     builtins["irandom"] = [](Runtime&, std::vector<Value>& a){ int m=(int)narg(a,0); return vnum(m>0?std::rand()%(m+1):0); };
+    builtins["random_range"] = [](Runtime&, std::vector<Value>& a){
+        double lo = narg(a,0), hi = narg(a,1);
+        if (hi < lo) std::swap(lo, hi);
+        return vnum(lo + (double)std::rand()/RAND_MAX * (hi - lo)); };
+    builtins["irandom_range"] = [](Runtime&, std::vector<Value>& a){
+        int lo = (int)narg(a,0), hi = (int)narg(a,1);
+        if (hi < lo) std::swap(lo, hi);
+        int span = hi - lo + 1;
+        return vnum(span > 0 ? (lo + std::rand() % span) : lo); };
+    builtins["random_set_seed"] = [](Runtime&, std::vector<Value>& a){ std::srand((unsigned)narg(a,0)); return vnum(0); };
+    builtins["random_get_seed"] = [](Runtime&, std::vector<Value>&){ return vnum((double)std::rand()); };
 
     builtins["collision_rectangle"] = [](Runtime& rt, std::vector<Value>& a){
         return vnum(collision_rect(rt, narg(a,0),narg(a,1),narg(a,2),narg(a,3),(int)narg(a,4), a.size()>6?(int)narg(a,6):-1)); };
@@ -987,6 +1286,15 @@ void Runtime::register_builtins() {
             int id = (int)narg(a,0);
             std::string k = to_str(a[1]);
             rt.ds_maps[id][k] = a[2];
+        }
+        return vnum(0);
+    };
+    builtins["ds_map_replace"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int id = (int)narg(a,0);
+            std::string k = to_str(a[1]);
+            rt.ds_maps[id][k] = a[2];
+            return vnum(1);
         }
         return vnum(0);
     };
@@ -1080,13 +1388,12 @@ void Runtime::register_builtins() {
 
     for (const char* n : {"file_exists","ini_open",
                           "ini_close","ini_read_real","ini_read_string","ini_section_exists",
-                          "ossafe_ini_open","ossafe_ini_close","randomize","audio_channel_num",
+                          "ossafe_ini_open","ossafe_ini_close","randomize",
                           "application_surface_enable",
                           "application_surface_draw_enable","display_set_gui_size","window_set_fullscreen",
                           "window_set_caption","texture_set_interpolation","draw_enable_alphablend",
                           "show_debug_message","show_message","screen_refresh","set_automatic_draw",
-                          "instance_deactivate_all","instance_activate_all","audio_pause_all",
-                          "audio_resume_all","snd_play","snd_loop","snd_stop","audio_play_sound",
+                          "instance_deactivate_all","instance_activate_all",
                           "file_text_open_write","file_text_write_string","file_text_close",
                           "file_delete","file_rename","steam_initialised","steam_file_exists",
                           "steam_file_delete","trophy_init","action_kill_object","action_move_to"})
@@ -1106,6 +1413,14 @@ void Runtime::register_builtins() {
     };
 
     // ---- bulk additions: strings / math / colour ----
+    builtins["string_replace"] = [](Runtime&, std::vector<Value>& a){
+        std::string s = sarg(a,0), from = sarg(a,1), to = sarg(a,2);
+        if (from.empty()) return Value(s);
+        size_t f = s.find(from);
+        if (f == std::string::npos) return vnum(0);
+        s.replace(f, from.size(), to);
+        return Value(s);
+    };
     builtins["string_replace_all"] = [](Runtime&, std::vector<Value>& a){
         std::string s = sarg(a,0), from = sarg(a,1), to = sarg(a,2);
         if (from.empty()) return Value(s);
@@ -1249,14 +1564,133 @@ void Runtime::register_builtins() {
     };
     builtins["draw_sprite_part_ext"] = builtins["draw_sprite_part"];
 
+    // ================= AUDIO =================
+    // Semantics: GameMaker Studio HTML5 runtime (Function_Sound.js +
+    // Function_Sound_Legacy.js). An argument is either an SOND asset index
+    // (0-based) or a voice handle >= kHandleBase (300000).
+    builtins["audio_play_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.audio_register_clips();
+        int asset = (a.size() > 0) ? (int)narg(a,0) : -1;
+        double priority = narg(a,1);
+        bool loop = to_bool(a.size() > 2 ? a[2] : Value(0.0));
+        double gain = (a.size() > 3) ? narg(a,3) : 1.0;
+        double offset = (a.size() > 4) ? narg(a,4) : 0.0;
+        double pitch = (a.size() > 5) ? narg(a,5) : 1.0;
+        int h = rt.audio->play(asset, loop, gain, offset, pitch, priority);
+        return vnum(h);
+    };
+    builtins["audio_play_sound_at"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        // positional playback; 3DS/host have no spatialisation -> non-positional.
+        rt.audio_register_clips();
+        int asset = (int)narg(a,0);
+        bool loop = to_bool(a.size() > 7 ? a[7] : Value(0.0));
+        double priority = (a.size() > 8) ? narg(a,8) : 1.0;
+        double gain = (a.size() > 9) ? narg(a,9) : 1.0;
+        double offset = (a.size() > 10) ? narg(a,10) : 0.0;
+        double pitch = (a.size() > 11) ? narg(a,11) : 1.0;
+        return vnum(rt.audio->play(asset, loop, gain, offset, pitch, priority));
+    };
+    builtins["audio_stop_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); int id = (int)narg(a,0);
+        if (id >= kHandleBase) rt.audio->stop_handle(id); else rt.audio->stop_asset(id);
+        return vnum(0);
+    };
+    builtins["audio_stop_all"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        rt.ensure_audio(); rt.audio->stop_all(); return vnum(0); };
+    builtins["audio_pause_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); int id = (int)narg(a,0);
+        if (id >= kHandleBase) rt.audio->pause_handle(id); else rt.audio->pause_asset(id);
+        return vnum(0);
+    };
+    builtins["audio_resume_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); int id = (int)narg(a,0);
+        if (id >= kHandleBase) rt.audio->resume_handle(id); else rt.audio->resume_asset(id);
+        return vnum(0);
+    };
+    builtins["audio_pause_all"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        rt.ensure_audio(); rt.audio->pause_all(); return vnum(0); };
+    builtins["audio_resume_all"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        rt.ensure_audio(); rt.audio->resume_all(); return vnum(0); };
+    builtins["audio_sound_gain"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); int id = (int)narg(a,0); double g = narg(a,1);
+        if (g < 0.0) g = 0.0;
+        if (id >= kHandleBase) rt.audio->set_gain_handle(id, g); else rt.audio->set_gain_asset(id, g);
+        return vnum(0);
+    };
+    builtins["audio_sound_get_gain"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); int id = (int)narg(a,0);
+        return vnum(id >= kHandleBase ? rt.audio->get_gain_handle(id) : rt.audio->get_gain_asset(id));
+    };
+    builtins["audio_sound_pitch"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); int id = (int)narg(a,0); double p = narg(a,1);
+        if (p <= 0.0) p = 0.0000001;
+        if (id >= kHandleBase) rt.audio->set_pitch_handle(id, p); else rt.audio->set_pitch_asset(id, p);
+        return vnum(0);
+    };
+    builtins["audio_sound_get_pitch"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); int id = (int)narg(a,0);
+        return vnum(id >= kHandleBase ? rt.audio->get_pitch_handle(id) : rt.audio->get_pitch_asset(id));
+    };
+    builtins["audio_is_playing"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); return vnum(rt.audio->is_playing((int)narg(a,0)) ? 1.0 : 0.0); };
+    builtins["audio_is_paused"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); return vnum(rt.audio->is_paused((int)narg(a,0)) ? 1.0 : 0.0); };
+    builtins["audio_sound_get_track_position"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); return vnum(rt.audio->get_track_position((int)narg(a,0))); };
+    builtins["audio_sound_set_track_position"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); rt.audio->set_track_position((int)narg(a,0), narg(a,1)); return vnum(0); };
+    builtins["audio_master_gain"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); rt.audio->set_master_gain(narg(a,0)); return vnum(0); };
+    builtins["audio_set_master_gain"] = builtins["audio_master_gain"];
+    builtins["audio_get_master_gain"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        rt.ensure_audio(); return vnum(rt.audio->master_gain()); };
+    builtins["audio_channel_num"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); rt.audio->set_max_voices((int)narg(a,0)); return vnum(0); };
+    builtins["audio_exists"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio(); int id = (int)narg(a,0);
+        if (id >= kHandleBase) return vnum(rt.audio->is_playing(id) ? 1.0 : 0.0);
+        return vnum(rt.audio->has_clip(id) ? 1.0 : 0.0);
+    };
+    builtins["audio_sound_length"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.audio_register_clips(); int asset = (int)narg(a,0);
+        if (asset >= kHandleBase) return vnum(-1.0);
+        std::vector<uint8_t> bytes;
+        if (asset < 0 || asset >= (int)rt.dw.sounds.size()) return vnum(-1.0);
+        const Sound& s = rt.dw.sounds[asset];
+        if (s.audo_id < 0) return vnum(-1.0);
+        bytes = rt.dw.audio_bytes(s.audo_id);
+        AudioClip clip;
+        if (!decode_audio(bytes.data(), bytes.size(), clip)) return vnum(-1.0);
+        return vnum(clip.duration());
+    };
+    // Legacy sound_*/snd_* API: operate on asset index (no handle).
+    builtins["snd_play"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int asset = (int)narg(a,0);
+        rt.audio_register_clips();
+        return vnum(rt.audio->play(asset, false, 1.0, 0.0, 1.0, 1.0));
+    };
+    builtins["snd_loop"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int asset = (int)narg(a,0);
+        rt.audio_register_clips();
+        return vnum(rt.audio->play(asset, true, 1.0, 0.0, 1.0, 1.0));
+    };
+    builtins["snd_stop"]     = builtins["audio_stop_sound"];
+    builtins["snd_stop_all"] = builtins["audio_stop_all"];
+    builtins["sound_play"]   = builtins["snd_play"];
+    builtins["sound_loop"]   = builtins["snd_loop"];
+    builtins["sound_stop"]   = builtins["snd_stop"];
+    builtins["sound_stop_all"] = builtins["snd_stop_all"];
+    builtins["sound_isplaying"] = builtins["audio_is_playing"];
+    builtins["sound_volume"] = builtins["audio_sound_gain"];
+    builtins["sound_global_volume"] = builtins["audio_master_gain"];
+
     // ---- harmless stubs (no 3DS equivalent / not needed yet) ----
     for (const char* n : {"ini_write_real","ini_write_string","ini_open_from_string","sprite_replace","sprite_delete",
         "sprite_create_from_surface","sprite_collision_mask","path_start","path_end","tile_layer_shift","tile_layer_hide",
         "tile_layer_show","move_snap","draw_line_width","draw_line_width_color","draw_line_color","draw_set_circle_precision",
         "draw_ellipse_color","draw_triangle","draw_triangle_color","draw_roundrect","draw_point_color","draw_clear_alpha",
-        "draw_sprite_stretched","draw_background_part_ext","draw_background_stretched","draw_surface","draw_surface_ext",
-        "audio_stop_all","audio_sound_gain","audio_stop_sound","audio_sound_pitch","audio_pause_sound","audio_resume_sound",
-        "audio_sound_set_track_position","window_set_position","window_center","steam_file_write_file",
+        "draw_background_part_ext","draw_background_stretched","draw_surface","draw_surface_ext",
+        "window_set_position","window_center","steam_file_write_file",
         "file_text_writeln","file_text_write_real","surface_set_target","surface_reset_target","surface_free",
         "buffer_async_group_option","buffer_async_group_begin","buffer_async_group_end","buffer_write","buffer_save_async",
         "buffer_load_async","buffer_delete","instance_change","instance_activate_object","room_set_persistent",
@@ -1264,12 +1698,12 @@ void Runtime::register_builtins() {
         "action_set_gravity","action_set_friction","action_previous_room","action_move_point","get_string_async",
         "joystick_check_button","joystick_has_pov","gamepad_axis_value","extension_stubfunc_real","ds_map_set_post"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    for (const char* n : {"audio_is_playing","gamepad_is_connected","window_get_fullscreen"})
+    for (const char* n : {"gamepad_is_connected","window_get_fullscreen"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["file_text_eof"] = [](Runtime&, std::vector<Value>&){ return vnum(1); };
     for (const char* n : {"joystick_buttons","gamepad_get_device_count","window_get_x","window_get_y","buffer_create",
-        "buffer_get_size","buffer_read","surface_create","audio_sound_get_pitch","audio_sound_get_gain",
-        "audio_sound_get_track_position","draw_getpixel","date_current_datetime","json_decode","json_encode"})
+        "buffer_get_size","buffer_read","surface_create",
+        "draw_getpixel","date_current_datetime","json_decode","json_encode"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     for (const char* n : {"file_text_open_read","file_text_read_string","file_text_readln","file_text_read_real"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
@@ -1285,6 +1719,12 @@ void Runtime::run_event(Instance* inst, int etype, int subtype) {
         if (it != o.events.end()) {
             auto jt = it->second.find(subtype);
             if (jt != it->second.end() && !jt->second.empty()) {
+                if (diag_sink) {
+                    std::string l = "event obj#" + std::to_string(inst->iid) + " " +
+                                    dw.objects[cur_obj].name + " etype=" + std::to_string(etype) +
+                                    " sub=" + std::to_string(subtype);
+                    diag_sink(l.c_str());
+                }
                 event_stack.push_back({inst, cur_obj, etype, subtype});
                 std::vector<Value> noargs;
                 for (int ci : jt->second) {
@@ -1414,15 +1854,49 @@ void Runtime::step() {
         if (!inst || !inst->alive) continue;
         for (int i = 0; i < 12; ++i) {
             if (inst->alarms[i] < 0) continue;
-            if (inst->alarms[i] <= 0) { inst->alarms[i] = -1; run_event(inst, 2, i); }
-            else inst->alarms[i]--;
+            // Official GM semantics (Events.js HandleAlarm): decrement first,
+            // then fire if it reached exactly 0 in this step.
+            inst->alarms[i]--;
+            if (inst->alarms[i] == 0) {
+                inst->alarms[i] = -1;
+                run_event(inst, 2, i);
+            }
         }
     }
-    for (int sub : {1, 0, 2}) {
+    for (int sub : {1, 0}) {
         size_t n = instances.size();
         for (size_t j = 0; j < n && j < instances.size(); ++j) {
             Instance* inst = instances[j].get();
             if (inst && inst->alive) run_event(inst, 3, sub);
+        }
+    }
+
+    // Motion & Animation advancement (between Step and End Step / collisions)
+    for (size_t j = 0; j < instances.size(); ++j) {
+        Instance* inst = instances[j].get();
+        if (!inst || !inst->alive) continue;
+        auto& v = inst->vars;
+        double cur_x = v.count("x") ? to_num(v["x"]) : 0.0;
+        double cur_y = v.count("y") ? to_num(v["y"]) : 0.0;
+        v["xprevious"] = Value(cur_x);
+        v["yprevious"] = Value(cur_y);
+
+        double hs = v.count("hspeed") ? to_num(v["hspeed"]) : 0.0;
+        double vs = v.count("vspeed") ? to_num(v["vspeed"]) : 0.0;
+        if (hs != 0.0) v["x"] = Value(cur_x + hs);
+        if (vs != 0.0) v["y"] = Value(cur_y + vs);
+
+        double img_spd = v.count("image_speed") ? to_num(v["image_speed"]) : 1.0;
+        double img_idx = v.count("image_index") ? to_num(v["image_index"]) : 0.0;
+        v["image_index"] = Value(img_idx + img_spd);
+    }
+
+    // End step (subtype 2)
+    {
+        size_t n = instances.size();
+        for (size_t j = 0; j < n && j < instances.size(); ++j) {
+            Instance* inst = instances[j].get();
+            if (inst && inst->alive) run_event(inst, 3, 2);
         }
     }
 
@@ -1446,7 +1920,6 @@ void Runtime::step() {
 
             double bx = to_num(b->vars.count("x") ? b->vars["x"] : Value(0.0));
             double by = to_num(b->vars.count("y") ? b->vars["y"] : Value(0.0));
-            if (std::abs(bx - ax) > 100.0 || std::abs(by - ay) > 100.0) continue;
 
             for (const auto& ev_pair : e4_it->second) {
                 int target_obj = (int)ev_pair.first;
@@ -1467,6 +1940,16 @@ void Runtime::step() {
     }
 
     if (pending_room >= 0) { int r = pending_room; pending_room = -1; change_room(r); }
+
+    // Pump the audio mixer: render one game-frame's worth of samples so the
+    // backend stays fed. Real device output is asynchronous (ALSA); the null
+    // backend just advances the deterministic clock.
+    if (audio) {
+        int speed = (int)(dw.rooms[room_index].speed ? dw.rooms[room_index].speed : 60);
+        if (speed <= 0) speed = 60;
+        int frames = (int)((double)audio->sample_rate() / (double)speed);
+        if (frames > 0) audio->render(frames);
+    }
 }
 
 Image Runtime::draw() {

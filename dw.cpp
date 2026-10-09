@@ -2,7 +2,7 @@
 
 #include <cstdlib>
 #include <cstdio>
-#ifndef __3DS__
+#if !defined(__3DS__) && !defined(_WIN32)
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -98,6 +98,8 @@ DataWin::DataWin(const std::string& path) {
 
     log_status("[10/10] Parsing rooms...\n");
     parse_rooms();
+    parse_sounds();
+    parse_audio();
     build_texture_index();
     log_status("Game data loaded successfully!\n");
 }
@@ -528,6 +530,82 @@ void DataWin::parse_rooms() {
     }
 }
 
+void DataWin::parse_sounds() {
+    // SOND: uint32 count, then `count` absolute pointers to UndertaleSound objects.
+    // UndertaleSound layout (bytecode >= 14, regular audio):
+    //   [u32 name_str][u32 flags][u32 type_str][u32 file_str]
+    //   [u32 effects][f32 volume][f32 pitch]
+    //   [i32 audio_group]           (regular audio; == builtin group -> next is audo id)
+    //   [i32 audio_file]            (index into AUDO)
+    auto it = chunks.find("SOND");
+    if (it == chunks.end()) return;
+    Chunk c = it->second;
+    uint32_t n = u32(c.off);
+    sounds.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t p = u32(c.off + 4 + 4 * i);
+        if (p == 0 || p >= m_file_size) continue;
+        Sound s;
+        uint32_t name_p = u32(p + 0);
+        s.flags       = u32(p + 4);
+        uint32_t type_p = u32(p + 8);
+        uint32_t file_p = u32(p + 12);
+        s.effects     = u32(p + 16);
+        s.volume      = f32(p + 20);
+        s.pitch       = f32(p + 24);
+        if (name_p) s.name = str_content(name_p);
+        if (type_p) s.type = str_content(type_p);
+        if (file_p) s.file = str_content(file_p);
+        // bytecode v16: the group id at +28; audo index at +32.
+        s.audo_id = i32(p + 32);
+        sounds.push_back(std::move(s));
+    }
+}
+
+void DataWin::parse_audio() {
+    // AUDO: uint32 count, then `count` absolute pointers to UndertaleEmbeddedAudio
+    // objects: [u32 length][length bytes of raw audio], 4-byte aligned.
+    auto it = chunks.find("AUDO");
+    if (it == chunks.end()) return;
+    Chunk c = it->second;
+    uint32_t n = u32(c.off);
+    audio.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t p = u32(c.off + 4 + 4 * i);
+        EmbeddedAudio e;
+        if (p != 0 && p < m_file_size) {
+            uint32_t len = u32(p);
+            // sanity: stay inside the file.
+            if ((uint64_t)p + 4 + len <= (uint64_t)m_file_size) {
+                e.offset = p + 4;
+                e.length = len;
+            }
+        }
+        audio.push_back(e);
+    }
+}
+
+std::vector<uint8_t> DataWin::audio_bytes(int audo_index) const {
+    std::vector<uint8_t> out;
+    if (audo_index < 0 || audo_index >= (int)audio.size()) return out;
+    const EmbeddedAudio& e = audio[audo_index];
+    if (e.length == 0) return out;
+    out.resize(e.length);
+    read_at(e.offset, e.length, out.data());
+    return out;
+}
+
+const Sound* DataWin::sound_by_name(const std::string& name) const {
+    int i = sound_index_by_name(name);
+    return i >= 0 ? &sounds[i] : nullptr;
+}
+
+int DataWin::sound_index_by_name(const std::string& name) const {
+    for (size_t i = 0; i < sounds.size(); ++i)
+        if (sounds[i].name == name) return (int)i;
+    return -1;
+}
+
 void DataWin::build_texture_index() {
     m_tex_end.clear();
     std::vector<uint32_t> starts = tex_ptrs;
@@ -555,18 +633,44 @@ Image DataWin::load_texture(int index) const {
     return img;
 }
 
+const Image& TexturePageCache::get(int tex_index, const DataWin& dw) {
+    return get_or_load(tex_index, [&](int idx) { return dw.load_texture(idx); });
+}
+
+const Image& DataWin::get_texture(int index) const {
+    return m_texture_cache.get(index, *this);
+}
+
+void DataWin::set_texture_cache_capacity(size_t cap) const {
+    m_texture_cache.set_capacity(cap);
+}
+
+void DataWin::clear_texture_cache() const {
+    m_texture_cache.clear();
+}
+
+size_t DataWin::texture_cache_size() const {
+    return m_texture_cache.size();
+}
+
 // --- compositor ---
 static inline void blend_px(uint8_t* dst, const uint8_t* src, int a) {
     float sa = (src[3] / 255.0f) * (a / 255.0f);
     if (sa <= 0) return;
-    for (int c = 0; c < 3; ++c)
-        dst[c] = (uint8_t)std::min(255.0f, src[c] * sa + dst[c] * (1 - sa));
-    dst[3] = 255;
+    float da = dst[3] / 255.0f;
+    float out_a = sa + da * (1.0f - sa);
+    if (out_a > 0) {
+        for (int c = 0; c < 3; ++c) {
+            float col = (src[c] * sa + dst[c] * da * (1.0f - sa)) / out_a;
+            dst[c] = (uint8_t)std::min(255.0f, std::max(0.0f, col));
+        }
+        dst[3] = (uint8_t)std::min(255.0f, std::max(0.0f, out_a * 255.0f));
+    }
 }
 
 static void blit(Image& dst, const Image& src, int dx, int dy, float alpha = 1.0f) {
     if (src.w <= 0 || src.h <= 0) return;
-    int a = (int)std::max(0.0f, std::min(1.0f, alpha)) * 255;
+    int a = (int)(std::max(0.0f, std::min(1.0f, alpha)) * 255.0f);
     for (int y = 0; y < src.h; ++y) {
         int ty = dy + y;
         if (ty < 0 || ty >= dst.h) continue;
@@ -590,6 +694,58 @@ static Image crop(const Image& src, int x0, int y0, int w, int h) {
     return out;
 }
 
+static Image scale_image(const Image& src, float sx, float sy) {
+    if (src.w <= 0 || src.h <= 0) return Image{};
+    if (std::abs(sx - 1.0f) < 1e-4f && std::abs(sy - 1.0f) < 1e-4f) return src;
+
+    int tw = (int)std::round(std::abs(sx) * src.w);
+    int th = (int)std::round(std::abs(sy) * src.h);
+    if (tw <= 0 || th <= 0) return Image{};
+
+    Image out;
+    out.w = tw;
+    out.h = th;
+    out.rgba.resize((size_t)tw * th * 4);
+
+    bool flip_x = (sx < 0);
+    bool flip_y = (sy < 0);
+
+    for (int y = 0; y < th; ++y) {
+        int src_y = (int)((float)y / th * src.h);
+        if (src_y >= src.h) src_y = src.h - 1;
+        if (flip_y) src_y = src.h - 1 - src_y;
+
+        for (int x = 0; x < tw; ++x) {
+            int src_x = (int)((float)x / tw * src.w);
+            if (src_x >= src.w) src_x = src.w - 1;
+            if (flip_x) src_x = src.w - 1 - src_x;
+
+            std::memcpy(&out.rgba[((size_t)y * tw + x) * 4],
+                        &src.rgba[((size_t)src_y * src.w + src_x) * 4], 4);
+        }
+    }
+    return out;
+}
+
+static Image tint_image(const Image& src, uint32_t color) {
+    if (color == 0xFFFFFFFF) return src;
+    uint8_t tr = (uint8_t)(color & 0xFF);
+    uint8_t tg = (uint8_t)((color >> 8) & 0xFF);
+    uint8_t tb = (uint8_t)((color >> 16) & 0xFF);
+    uint8_t ta = (uint8_t)((color >> 24) & 0xFF);
+    if (ta == 0 && color <= 0x00FFFFFF) ta = 255;
+    Image out = src;
+    for (size_t i = 0; i < out.rgba.size(); i += 4) {
+        out.rgba[i + 0] = (uint8_t)((out.rgba[i + 0] * tr) / 255);
+        out.rgba[i + 1] = (uint8_t)((out.rgba[i + 1] * tg) / 255);
+        out.rgba[i + 2] = (uint8_t)((out.rgba[i + 2] * tb) / 255);
+        if (ta != 255) {
+            out.rgba[i + 3] = (uint8_t)((out.rgba[i + 3] * ta) / 255);
+        }
+    }
+    return out;
+}
+
 Image DataWin::render_room(int room_index) const {
 
     const Room& room = rooms[room_index];
@@ -597,18 +753,18 @@ Image DataWin::render_room(int room_index) const {
     canvas.w = std::max<uint32_t>(1u, room.width);
     canvas.h = std::max<uint32_t>(1u, room.height);
     canvas.rgba.assign((size_t)canvas.w * canvas.h * 4, 0);
-    uint8_t bg[4] = { (uint8_t)((room.bg_color >> 16) & 0xFF),
-                      (uint8_t)((room.bg_color >> 8) & 0xFF),
-                      (uint8_t)(room.bg_color & 0xFF), 255 };
-    for (size_t i = 0; i < canvas.rgba.size(); i += 4) std::memcpy(&canvas.rgba[i], bg, 4);
 
-    // cache texture pages by tpag tex index
-    auto page = [&](int texi) { return load_texture(texi); };
-    std::unordered_map<int, Image> page_cache;
+    // Respect room.draw_bg_color flag
+    if (room.draw_bg_color) {
+        uint8_t bg[4] = { (uint8_t)(room.bg_color & 0xFF),
+                          (uint8_t)((room.bg_color >> 8) & 0xFF),
+                          (uint8_t)((room.bg_color >> 16) & 0xFF), 255 };
+        for (size_t i = 0; i < canvas.rgba.size(); i += 4) std::memcpy(&canvas.rgba[i], bg, 4);
+    }
+
+    // Access texture page via DataWin's LRU cache
     auto get_page = [&](int idx) -> const Image& {
-        auto it = page_cache.find(idx);
-        if (it == page_cache.end()) it = page_cache.emplace(idx, page(idx)).first;
-        return it->second;
+        return get_texture(idx);
     };
 
     // backgrounds (behind)
@@ -626,21 +782,39 @@ Image DataWin::render_room(int room_index) const {
             if (bg.stretch) {
                 // nearest resize to room size
                 Image rs; rs.w = room.width; rs.h = room.height; rs.rgba.assign((size_t)room.width*room.height*4,0);
-                for (uint32_t y=0;y<room.height;y++) for (uint32_t x=0;x<room.width;x++) {
-                    int sx = (int)((float)x/src.w*src.w), sy=(int)((float)y/src.h*src.h);
-                    (void)sx;(void)sy;
-                    int px = (int)((float)x / room.width * src.w);
-                    int py = (int)((float)y / room.height * src.h);
-                    if (px>=src.w)px=src.w-1; if (py>=src.h)py=src.h-1;
-                    std::memcpy(&rs.rgba[((size_t)y*rs.w+x)*4], &src.rgba[((size_t)py*src.w+px)*4],4);
+                for (uint32_t y = 0; y < room.height; ++y) {
+                    for (uint32_t x = 0; x < room.width; ++x) {
+                        int px = (int)((float)x / room.width * src.w);
+                        int py = (int)((float)y / room.height * src.h);
+                        if (px >= src.w) px = src.w - 1;
+                        if (py >= src.h) py = src.h - 1;
+                        std::memcpy(&rs.rgba[((size_t)y * rs.w + x) * 4], &src.rgba[((size_t)py * src.w + px) * 4], 4);
+                    }
                 }
                 blit(canvas, rs, bg.x, bg.y);
-            } else if (bg.tile_x || bg.tile_y) {
-                for (int yy = 0; yy < canvas.h; yy += std::max(1, src.h))
-                    for (int xx = 0; xx < canvas.w; xx += std::max(1, src.w))
-                        blit(canvas, src, bg.x+xx, bg.y+yy);
             } else {
-                blit(canvas, src, bg.x, bg.y);
+                // Support tile_x only, tile_y only, or both correctly
+                int step_x = std::max(1, src.w);
+                int step_y = std::max(1, src.h);
+                int start_x = bg.x;
+                int end_x = bg.x + 1;
+                if (bg.tile_x) {
+                    start_x = bg.x % step_x;
+                    if (start_x > 0) start_x -= step_x;
+                    end_x = canvas.w;
+                }
+                int start_y = bg.y;
+                int end_y = bg.y + 1;
+                if (bg.tile_y) {
+                    start_y = bg.y % step_y;
+                    if (start_y > 0) start_y -= step_y;
+                    end_y = canvas.h;
+                }
+                for (int cy = start_y; cy < end_y; cy += step_y) {
+                    for (int cx = start_x; cx < end_x; cx += step_x) {
+                        blit(canvas, src, cx, cy);
+                    }
+                }
             }
         }
         if (pass == 0) {
@@ -655,9 +829,23 @@ Image DataWin::render_room(int room_index) const {
                 const Tpag* tp = tpag(b.tpag);
                 if (!tp || tp->tex < 0) continue;
                 const Image& pg = get_page(tp->tex);
-                if (tl->srcx < 0 || tl->srcy < 0 || tl->srcx + tl->w > pg.w || tl->srcy + tl->h > pg.h) continue;
-                Image src = crop(pg, tl->srcx, tl->srcy, tl->w, tl->h);
-                blit(canvas, src, tl->x, tl->y);
+                // Tile Texture Atlas UV Fix: sampling from (tp->sx + tl->srcx, tp->sy + tl->srcy)
+                int sheet_x = tp->sx + tl->srcx;
+                int sheet_y = tp->sy + tl->srcy;
+                if (tl->w <= 0 || tl->h <= 0) continue;
+                if (sheet_x >= pg.w || sheet_y >= pg.h || sheet_x + tl->w <= 0 || sheet_y + tl->h <= 0) continue;
+                Image src = crop(pg, sheet_x, sheet_y, tl->w, tl->h);
+                if (tl->scale_x != 1.0f || tl->scale_y != 1.0f) {
+                    src = scale_image(src, tl->scale_x, tl->scale_y);
+                }
+                if (tl->color != 0xFFFFFFFF) {
+                    src = tint_image(src, tl->color);
+                }
+                int tx = tl->x;
+                int ty = tl->y;
+                if (tl->scale_x < 0) tx += (int)std::round(tl->scale_x * tl->w);
+                if (tl->scale_y < 0) ty += (int)std::round(tl->scale_y * tl->h);
+                blit(canvas, src, tx, ty);
             }
         }
     }
@@ -681,8 +869,14 @@ Image DataWin::render_room(int room_index) const {
         if (!tp || tp->tex < 0) continue;
         const Image& pg = get_page(tp->tex);
         Image src = crop(pg, tp->sx, tp->sy, tp->sw, tp->sh);
-        int dx = in->x - sp.origin_x + tp->tx;
-        int dy = in->y - sp.origin_y + tp->ty;
+        if (in->scale_x != 1.0f || in->scale_y != 1.0f) {
+            src = scale_image(src, in->scale_x, in->scale_y);
+        }
+        if (in->color != 0xFFFFFFFF) {
+            src = tint_image(src, in->color);
+        }
+        int dx = in->x + (int)std::round(in->scale_x >= 0 ? (tp->tx - sp.origin_x) * in->scale_x : (tp->tx + tp->sw - sp.origin_x) * in->scale_x);
+        int dy = in->y + (int)std::round(in->scale_y >= 0 ? (tp->ty - sp.origin_y) * in->scale_y : (tp->ty + tp->sh - sp.origin_y) * in->scale_y);
         blit(canvas, src, dx, dy, 1.0f);
     }
 

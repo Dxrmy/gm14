@@ -11,6 +11,9 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <list>
+#include <algorithm>
+#include <utility>
 #include <memory>
 #include <stdexcept>
 
@@ -178,6 +181,90 @@ struct Font {
     std::unordered_map<uint16_t, Glyph> glyphs;
 };
 
+struct Sound {
+    std::string name;
+    uint32_t flags = 0;    // 0x1 embedded, 0x2 compressed, 0x64 regular
+    std::string type;
+    std::string file;
+    uint32_t effects = 0;
+    float volume = 1.0f;
+    float pitch = 0.0f;    // (panning in legacy GMS)
+    int32_t audo_id = -1;  // index into DataWin::audio, -1 when unembedded
+    bool is_embedded() const { return (flags & 0x1) != 0; }
+};
+
+struct EmbeddedAudio {
+    uint32_t offset = 0;   // absolute file offset of the data blob
+    uint32_t length = 0;   // blob byte length
+};
+
+class DataWin;
+
+// LRU cache for decoded texture pages (budgeted memory for constrained platforms / o3DS)
+class TexturePageCache {
+public:
+    explicit TexturePageCache(size_t max_pages = 8) : m_capacity(std::max<size_t>(1, max_pages)) {}
+
+    void set_capacity(size_t cap) {
+        m_capacity = std::max<size_t>(1, cap);
+        trim();
+    }
+    size_t capacity() const { return m_capacity; }
+    size_t size() const { return m_order.size(); }
+
+    void clear() {
+        m_entries.clear();
+        m_order.clear();
+    }
+
+    bool contains(int tex_index) const {
+        return m_entries.find(tex_index) != m_entries.end();
+    }
+
+    template <typename Loader>
+    const Image& get_or_load(int tex_index, Loader&& loader) {
+        auto it = m_entries.find(tex_index);
+        if (it != m_entries.end()) {
+            m_order.splice(m_order.begin(), m_order, it->second.lru_it);
+            return it->second.image;
+        }
+        while (m_order.size() >= m_capacity) {
+            evict_oldest();
+        }
+        Image img = loader(tex_index);
+        m_order.push_front(tex_index);
+        Entry entry{ std::move(img), m_order.begin() };
+        auto inserted = m_entries.emplace(tex_index, std::move(entry));
+        return inserted.first->second.image;
+    }
+
+    const Image& get(int tex_index, const DataWin& dw);
+
+    bool evict_oldest() {
+        if (m_order.empty()) return false;
+        int oldest_idx = m_order.back();
+        m_order.pop_back();
+        m_entries.erase(oldest_idx);
+        return true;
+    }
+
+private:
+    void trim() {
+        while (m_order.size() > m_capacity) {
+            evict_oldest();
+        }
+    }
+
+    struct Entry {
+        Image image;
+        std::list<int>::iterator lru_it;
+    };
+
+    size_t m_capacity = 8;
+    std::list<int> m_order; // front = MRU, back = LRU
+    std::unordered_map<int, Entry> m_entries;
+};
+
 class DataWin {
 public:
     explicit DataWin(const std::string& path);
@@ -210,9 +297,22 @@ public:
     std::vector<Font> fonts;
     std::vector<ObjDef> objects;
     std::vector<Room> rooms;
+    std::vector<Sound> sounds;
+    std::vector<EmbeddedAudio> audio;
+
+    // Load the raw bytes of an embedded audio entry (AUDO).
+    std::vector<uint8_t> audio_bytes(int audo_index) const;
+    const Sound* sound_by_name(const std::string& name) const;
+    int sound_index_by_name(const std::string& name) const;
+    const Sound* sound_at(int index) const { return (index >= 0 && index < (int)sounds.size()) ? &sounds[index] : nullptr; }
 
     // helpers
     Image load_texture(int index) const;
+    const Image& get_texture(int index) const;
+    void set_texture_cache_capacity(size_t cap) const;
+    void clear_texture_cache() const;
+    size_t texture_cache_size() const;
+    TexturePageCache& texture_cache() const { return m_texture_cache; }
     const Tpag* tpag(int i) const { return (i >= 0 && i < (int)tpags.size()) ? &tpags[i] : nullptr; }
 
     // render room i to an RGBA buffer (room size)
@@ -228,6 +328,7 @@ public:
 private:
     FILE* m_fp = nullptr;
     size_t m_file_size = 0;
+    mutable TexturePageCache m_texture_cache{8};
     std::vector<uint8_t> m_code_cache, m_strg_cache;
     uint32_t m_code_off = 0, m_code_len = 0, m_strg_off = 0, m_strg_len = 0;
     mutable std::vector<uint8_t> m_sector_buf;
@@ -261,6 +362,8 @@ private:
     void parse_fonts();
     void parse_objects();
     void parse_rooms();
+    void parse_sounds();
+    void parse_audio();
     void build_texture_index();
 
     // texture blob bounds

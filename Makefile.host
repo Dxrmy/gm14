@@ -1,14 +1,25 @@
-# Host build for the gm14 C++ core (Linux/macOS).
+# Host build for the gm14 C++ core (Windows / POSIX host).
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall
+LDFLAGS ?= -lwinmm -static
 
-all: gm14_host vm_host
+TARGETS = gm14_host.exe vm_host.exe vm_tests.exe
 
-gm14_host: main_host.cpp dw.cpp dw.hpp
-	$(CXX) $(CXXFLAGS) -o $@ main_host.cpp dw.cpp
+all: $(TARGETS)
 
-vm_host: vm_host.cpp vm.cpp dw.cpp vm.hpp dw.hpp
-	$(CXX) $(CXXFLAGS) -o $@ vm_host.cpp vm.cpp dw.cpp
+gm14_host.exe: main_host.cpp dw.cpp dw.hpp
+	$(CXX) $(CXXFLAGS) -o $@ main_host.cpp dw.cpp $(LDFLAGS)
+
+vm_host.exe: vm_host.cpp vm.cpp dw.cpp audio.cpp stb_vorbis_impl.c vm.hpp dw.hpp audio.hpp
+	$(CXX) $(CXXFLAGS) -o $@ vm_host.cpp vm.cpp dw.cpp audio.cpp stb_vorbis_impl.c $(LDFLAGS)
+
+vm_tests.exe: vm_tests.cpp vm.cpp dw.cpp audio.cpp stb_vorbis_impl.c vm.hpp dw.hpp audio.hpp
+	$(CXX) $(CXXFLAGS) -o $@ vm_tests.cpp vm.cpp dw.cpp audio.cpp stb_vorbis_impl.c $(LDFLAGS)
+
+# Aliases without .exe
+gm14_host: gm14_host.exe
+vm_host: vm_host.exe
+vm_tests: vm_tests.exe
 
 clean:
-	rm -f gm14_host vm_host out_room_*.png vm_frame.png
+	rm -f $(TARGETS) gm14_host vm_host vm_tests *.o out_room_*.png vm_frame.png test_intro_*.png

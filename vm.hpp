@@ -1,6 +1,7 @@
 // gm14 C++ virtual machine (port of gmlib/vm.py) for the 3DS build.
 #pragma once
 #include "dw.hpp"
+#include "audio.hpp"
 #include <functional>
 #include <unordered_map>
 #include <vector>
@@ -16,6 +17,9 @@ struct Value {
     enum Type { NUM, STR, UNDEF, VARPTR } type = UNDEF;
     double num = 0;
     std::string str;
+    // When a scalar read resolves to an array-backed variable, carry the array
+    // so builtins (string_char_at, draw_text, ...) can index it as GM does.
+    const std::vector<Value>* arrref = nullptr;
 
     Value() {}
     Value(double n) : type(NUM), num(n) {}
@@ -24,6 +28,7 @@ struct Value {
     Value(const char* s) : type(STR), str(s) {}
     bool is_str() const { return type == STR; }
     bool is_num() const { return type == NUM; }
+    bool is_arr() const { return arrref != nullptr; }
 };
 
 double to_num(const Value& v);
@@ -91,7 +96,10 @@ public:
     bool running = true;
     bool fast_boot = true;
     int frame_count = 0;
+    // Optional diagnostic sink (set by the 3DS front-end while recording).
+    void (*diag_sink)(const char*) = nullptr;
     std::set<std::string> warned;
+    std::vector<std::string> m_unimplemented;   // unknown builtins seen, in order
 
     // input
     std::set<int> keys_held, keys_pressed, keys_released;
@@ -108,6 +116,13 @@ public:
     void blit_screen(const Image& src, int dx, int dy, double alpha);
     void blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, int dx, int dy, double alpha);
     void blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int sh, int dx, int dy, double alpha, uint32_t color);
+    // Scaled + tinted + optionally rotated blit. (dx,dy) is the top-left of the
+    // destination rect; out_w/out_h are the scaled size. angle is in degrees,
+    // applied about the rect centre. When angle==0 and out size==src size this
+    // is equivalent to blit_sub_screen_tint.
+    void blit_sub_screen_scaled(const Image& src, int sx, int sy, int sw, int sh,
+                                int dx, int dy, int out_w, int out_h,
+                                double alpha, uint32_t color, double angle_deg = 0.0);
 
     using Builtin = std::function<Value(Runtime&, std::vector<Value>&)>;
     std::unordered_map<std::string, Builtin> builtins;
@@ -115,6 +130,12 @@ public:
     int next_ds_map = 1;
     std::unordered_map<int, std::vector<Value>> ds_lists;
     int next_ds_list = 1;
+
+    // audio
+    std::unique_ptr<AudioEngine> audio;
+    void ensure_audio();
+    int audio_asset_index(const Value& v) const;   // asset index from a GML sound value
+    void audio_register_clips();                   // decode all SOND clips (lazy, cached)
 
     // lifecycle
     void start_room(int index, std::vector<std::unique_ptr<Instance>> keep = {});

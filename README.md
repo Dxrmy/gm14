@@ -67,6 +67,7 @@ make -f Makefile.host
 
 ## Related
 
+- **[gm14-x86_64](https://github.com/Dxrmy/gm14-x86_64)** — Dedicated PC (Windows / Linux) runner & 100% passing test harness.
 - **[gm14-3ds](https://github.com/Dxrmy/gm14-3ds)** — Nintendo 3DS front-end.
 
 ## License
