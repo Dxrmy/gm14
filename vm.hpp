@@ -221,7 +221,7 @@ public:
 
     void exec(Frame& fr);
     Value get_var(Frame& fr, const Instruction& ins);
-    void set_var(Frame& fr, const Instruction& ins, const Value& v);
+    void set_var(Frame& fr, const Instruction& ins, int inst_type, const Value& v);
     Value get_array(Frame& fr, const Instruction& ins, int inst_type, int index);
     void set_array(Frame& fr, const Instruction& ins, int inst_type, int index, const Value& v);
     Instance* resolve_inst(int inst_type);

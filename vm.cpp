@@ -199,11 +199,7 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
     return Value(0.0);
 }
 
-void Runtime::set_var(Frame& fr, const Instruction& ins, const Value& v) {
-    int inst_type = (int)(int16_t)ins.low16();
-    if (inst_type == -9 || ins.ref_type() == 0x80) {
-        if (!fr.stack.empty()) { inst_type = (int)to_num(fr.stack.back()); fr.stack.pop_back(); }
-    }
+void Runtime::set_var(Frame& fr, const Instruction& ins, int inst_type, const Value& v) {
     std::string name;
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
@@ -211,8 +207,31 @@ void Runtime::set_var(Frame& fr, const Instruction& ins, const Value& v) {
         globals[name] = v;
         return;
     }
-    if (inst_type == -5) { globals[name] = v; return; }
-    if (inst_type == -7) { if (varid >= 0 && varid < (int)fr.locals.size()) fr.locals[varid] = v; return; }
+    if (inst_type == -5) {
+        if (v.is_arr() && v.arrref) {
+            global_arrays[name] = *v.arrref;
+            Value av; av.type = Value::VARPTR; av.arrref = &global_arrays[name];
+            globals[name] = av;
+        } else {
+            global_arrays.erase(name);
+            globals[name] = v;
+        }
+        return;
+    }
+    if (inst_type == -7) {
+        if (varid >= 0) {
+            if (varid >= (int)fr.locals.size()) fr.locals.resize(varid + 1, Value(0.0));
+            if (v.is_arr() && v.arrref) {
+                fr.local_arrays[varid] = *v.arrref;
+                Value av; av.type = Value::VARPTR; av.arrref = &fr.local_arrays[varid];
+                fr.locals[varid] = av;
+            } else {
+                fr.local_arrays.erase(varid);
+                fr.locals[varid] = v;
+            }
+        }
+        return;
+    }
     if (inst_type == -15) { if (varid >= 0 && varid < (int)fr.args.size()) fr.args[varid] = v; return; }
     if (name.size() > 8 && name.compare(0, 8, "argument") == 0) {
         int idx = 0; std::string num = name.substr(8);
@@ -220,8 +239,38 @@ void Runtime::set_var(Frame& fr, const Instruction& ins, const Value& v) {
         if (idx >= 0 && idx < (int)fr.args.size()) fr.args[idx] = v;
         return;
     }
-    Instance* inst = resolve_inst(inst_type);
-    if (inst) inst->vars[name] = v;
+
+    auto set_inst = [&](Instance* inst) {
+        if (!inst) return;
+        if (v.is_arr() && v.arrref) {
+            inst->arrays[name] = *v.arrref;
+            Value av; av.type = Value::VARPTR; av.arrref = &inst->arrays[name];
+            inst->vars[name] = av;
+        } else {
+            inst->arrays.erase(name);
+            inst->vars[name] = v;
+        }
+        if (name == "speed" || name == "direction") {
+            double spd = inst->vars.count("speed") ? to_num(inst->vars["speed"]) : 0.0;
+            double dir = inst->vars.count("direction") ? to_num(inst->vars["direction"]) : 0.0;
+            inst->vars["hspeed"] = Value(spd * std::cos(dir * 3.141592653589793 / 180.0));
+            inst->vars["vspeed"] = Value(-spd * std::sin(dir * 3.141592653589793 / 180.0));
+        } else if (name == "hspeed" || name == "vspeed") {
+            double hs = inst->vars.count("hspeed") ? to_num(inst->vars["hspeed"]) : 0.0;
+            double vs = inst->vars.count("vspeed") ? to_num(inst->vars["vspeed"]) : 0.0;
+            inst->vars["speed"] = Value(std::hypot(hs, vs));
+            double dir = std::atan2(-vs, hs) * 180.0 / 3.141592653589793;
+            if (dir < 0) dir += 360.0;
+            inst->vars["direction"] = Value(dir);
+        }
+    };
+    if (inst_type == -3) {
+        for (auto& i : instances) if (i->alive) set_inst(i.get());
+    } else if (inst_type >= 0 && inst_type < 100000) {
+        for (auto& i : instances) if (i->alive && is_obj(dw, i.get(), inst_type)) set_inst(i.get());
+    } else {
+        set_inst(resolve_inst(inst_type));
+    }
 }
 
 Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int index) {
@@ -249,18 +298,26 @@ Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int i
     if (inst_type == -5) {
         auto it = global_arrays.find(name);
         if (it != global_arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
+        auto vit = globals.find(name);
+        if (vit != globals.end() && vit->second.is_arr() && vit->second.arrref &&
+            index >= 0 && index < (int)vit->second.arrref->size()) return (*vit->second.arrref)[index];
         return Value(0.0);
     }
     if (inst_type == -7) {
         int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
         auto it = fr.local_arrays.find(varid);
         if (it != fr.local_arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
+        if (varid >= 0 && varid < (int)fr.locals.size() && fr.locals[varid].is_arr() && fr.locals[varid].arrref &&
+            index >= 0 && index < (int)fr.locals[varid].arrref->size()) return (*fr.locals[varid].arrref)[index];
         return Value(0.0);
     }
     Instance* inst = resolve_inst(inst_type);
     if (inst) {
         auto it = inst->arrays.find(name);
         if (it != inst->arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
+        auto vit = inst->vars.find(name);
+        if (vit != inst->vars.end() && vit->second.is_arr() && vit->second.arrref &&
+            index >= 0 && index < (int)vit->second.arrref->size()) return (*vit->second.arrref)[index];
     }
     return Value(0.0);
 }
@@ -287,23 +344,69 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
         return;
     }
     if (name == "alarm") {
-        Instance* inst = (inst_type > 0) ? resolve_inst(inst_type) : cur;
-        if (inst && index >= 0 && index < 12) inst->alarms[index] = (to_num(v) < 0) ? -1 : (int)to_num(v);
+        auto set_alarm_on_inst = [&](Instance* inst) {
+            if (inst && index >= 0 && index < 12) inst->alarms[index] = (to_num(v) < 0) ? -1 : (int)to_num(v);
+        };
+        if (inst_type == -3) {
+            for (auto& i : instances) if (i->alive) set_alarm_on_inst(i.get());
+        } else if (inst_type >= 0 && inst_type < 100000) {
+            for (auto& i : instances) if (i->alive && is_obj(dw, i.get(), inst_type)) set_alarm_on_inst(i.get());
+        } else {
+            set_alarm_on_inst(resolve_inst(inst_type));
+        }
         return;
     }
-    std::vector<Value>* arr = nullptr;
-    if (inst_type == -5) arr = &global_arrays[name];
-    else if (inst_type == -7) {
-        int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
-        arr = &fr.local_arrays[varid];
-    } else {
-        Instance* inst = resolve_inst(inst_type);
-        if (!inst) return;
-        arr = &inst->arrays[name];
+    if (inst_type == -5) {
+        if (!global_arrays.count(name) && globals.count(name) && globals[name].is_arr() && globals[name].arrref) {
+            global_arrays[name] = *globals[name].arrref;
+        }
+        auto& arr = global_arrays[name];
+        Value av; av.type = Value::VARPTR; av.arrref = &arr;
+        globals[name] = av;
+        if (index >= 0) {
+            if (index >= (int)arr.size()) arr.resize(index + 1, Value(0.0));
+            arr[index] = v;
+        }
+        return;
     }
-    if (index < 0) return;
-    if (index >= (int)arr->size()) arr->resize(index + 1, Value(0.0));
-    (*arr)[index] = v;
+    if (inst_type == -7) {
+        int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
+        if (varid >= 0 && varid < (int)fr.locals.size() && !fr.local_arrays.count(varid) && fr.locals[varid].is_arr() && fr.locals[varid].arrref) {
+            fr.local_arrays[varid] = *fr.locals[varid].arrref;
+        }
+        auto& arr = fr.local_arrays[varid];
+        Value av; av.type = Value::VARPTR; av.arrref = &arr;
+        if (varid >= 0) {
+            if (varid >= (int)fr.locals.size()) fr.locals.resize(varid + 1, Value(0.0));
+            fr.locals[varid] = av;
+        }
+        if (index >= 0) {
+            if (index >= (int)arr.size()) arr.resize(index + 1, Value(0.0));
+            arr[index] = v;
+        }
+        return;
+    }
+
+    auto set_inst_arr = [&](Instance* inst) {
+        if (!inst) return;
+        if (!inst->arrays.count(name) && inst->vars.count(name) && inst->vars[name].is_arr() && inst->vars[name].arrref) {
+            inst->arrays[name] = *inst->vars[name].arrref;
+        }
+        auto& arr = inst->arrays[name];
+        Value av; av.type = Value::VARPTR; av.arrref = &arr;
+        inst->vars[name] = av;
+        if (index >= 0) {
+            if (index >= (int)arr.size()) arr.resize(index + 1, Value(0.0));
+            arr[index] = v;
+        }
+    };
+    if (inst_type == -3) {
+        for (auto& i : instances) if (i->alive) set_inst_arr(i.get());
+    } else if (inst_type >= 0 && inst_type < 100000) {
+        for (auto& i : instances) if (i->alive && is_obj(dw, i.get(), inst_type)) set_inst_arr(i.get());
+    } else {
+        set_inst_arr(resolve_inst(inst_type));
+    }
 }
 
 // ---------------- execution ----------------
@@ -402,8 +505,12 @@ void Runtime::exec(Frame& fr) {
                 Value v = stk_pop();
                 set_array(fr, ins, it, idx, v);
             } else {
+                int inst_type = (int)(int16_t)ins.low16();
+                if (inst_type == -9 || ins.ref_type() == 0x80) {
+                    inst_type = (int)to_num(stk_pop());
+                }
                 Value v = stk_pop();
-                set_var(fr, ins, v);
+                set_var(fr, ins, inst_type, v);
             }
             fr.pc++;
         } else if (k == OP_POPZ) {
