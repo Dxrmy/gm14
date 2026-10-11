@@ -209,6 +209,8 @@ public:
     void audio_register_clips();                   // decode all SOND clips (lazy, cached)
 
     // lifecycle
+    bool current_room_persistent = false;
+    std::unordered_map<int, std::vector<std::unique_ptr<Instance>>> persistent_rooms;
     void start_room(int index, std::vector<std::unique_ptr<Instance>> keep = {});
     void change_room(int index);
     void run_event(Instance* inst, int etype, int subtype);
