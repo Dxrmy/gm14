@@ -8,3 +8,9 @@ vm_host
 out_room_*.png
 vm_frame.png
 build/
+*.ini
+!*.ini.example
+saves/
+save/
+*.sav
+*.rec
