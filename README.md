@@ -15,11 +15,12 @@ This repository serves as the **platform-agnostic core**: standard C++17 with cl
 | Subsystem | Progress Bar | Status | Coverage / Details |
 |---|---|---|---|
 | **`data.win` Chunk & Asset Parsing** | `[██████████]` 100% | **Complete** | All 24 chunks parsed (FORM, GEN8, OPTN, SOND, SPRT, BGND, SCPT, FONT, OBJT, ROOM, DAFL, TPAG, CODE, VARI, FUNC, STRG, TXTR, AUDO, PATH, ...) |
-| **Bytecode Virtual Machine** | `[█████████░]` 96% | **In Progress** | 891k ops across 6,272 code entries, stack machine, scopes, user script shadowing, compound array operations |
-| **Automated Unit Test Suite** | `[██████████]` 100% | **Complete** | **181 / 181 passing unit tests** across all core runtime subsystems |
+| **Bytecode Virtual Machine** | `[█████████░]` 97% | **In Progress** | 891k ops across 6,272 code entries, stack machine, scopes, user script shadowing, collision event routing, dialogue state machine |
+| **Automated Unit Test Suite** | `[██████████]` 100% | **Complete** | **198 / 198 passing unit tests** across all core runtime subsystems, Flowey battle collision, and dialogue interact isolation |
+| **State Save / Load Core** | `[██████████]` 100% | **Complete** | Portable binary state format (`GM14STAT` v1), full memory serialization (globals, arrays, VARPTR, DS structures, persistent rooms, audio voices) |
 | **Graphics & Compositor** | `[█████████░]` 92% | **In Progress** | Origin-pivoted sprite rotations, CCW conventions, blend modes (`bm_add`), tile atlas UV mapping & depth layering |
 | **Path Traversal & Kinematics** | `[█████████░]` 95% | **In Progress** | `PATH` interpolation, entrance marker placement, directional heading calculation, path action handling |
-| **Audio & Music Mixer** | `[█████████░]` 95% | **In Progress** | Multi-voice mixer, native WaveOut/ALSA, `stb_vorbis` decoding, GM `audio_*` and Undertale `caster_*` engines |
+| **Audio & Music Mixer** | `[█████████░]` 95% | **In Progress** | Working realtime audio on PC (native Win32 WaveOut / Linux ALSA), multi-voice mixer, `stb_vorbis` decoding, GM `audio_*` and Undertale `caster_*` engines |
 | **Battle Engine & Menu Flow** | `[█████████░]` 90% | **In Progress** | Battle controller, FIGHT / ACT / ITEM / MERCY navigation, monster setup, damage computation, target cursors |
 | **Overworld & Dialog Engine** | `[█████████░]` 92% | **In Progress** | C-menu item/stat screens, multi-page typewriter text rendering (`OBJ_WRITER`), camera tracking, room transitions |
 | **Memory Budgets & Config (`gm14.ini`)** | `[██████████]` 100% | **Complete** | Explicit INI config with bounded LRU texture cache, bounded PCM audio budget, watchdog, and culling margins |
@@ -203,8 +204,9 @@ verbose_logging = 0
 - **Configurable Engine Architecture (`gm14.ini`)** — bounded LRU texture caching, bounded PCM audio budget, watchdog instruction budget, tile culling margin, blend modes, and target framerate.
 - **Path Traversal Engine** — full GameMaker path system (`path_start`, `path_end`, `path_position`, `path_speed`, etc.) with directional kinematics and two-pass entrance marker placement.
 - **Sprite Transformation & Blend Modes** — origin-pivoted rotation for `draw_sprite_ext`, `draw_self`, and default instance drawing (`obj_winkstar`), CCW rotation matrix, and additive blend mode support (`bm_add`).
-- **Audio & Music Engine** — native mixer with gain, pitch shift, looping, embedded Ogg Vorbis/WAV decoding (`stb_vorbis`), GameMaker `audio_*` builtins, and Undertale `caster_*` support.
-- **100% Passing Test Suite** — **181 passing unit tests** covering all runtime subsystems.
+- **Audio & Music Engine** — native mixer with gain, pitch shift, looping, embedded Ogg Vorbis/WAV decoding (`stb_vorbis`), GameMaker `audio_*` builtins, and Undertale `caster_*` support (WaveOut on Windows, ALSA on Linux).
+- **State Save / Load Snapshot Engine** — full binary state serialization (`GM14STAT` format v1), restoring all globals, dynamic arrays with `VARPTR` references, DS data structures, persistent rooms, and active audio voice channels.
+- **100% Passing Test Suite** — **198 passing unit tests** covering all runtime subsystems, state persistence, Flowey battle collision, and dialogue interact isolation.
 - **Portable** — builds on Linux, macOS, and Windows with only a standard C++17 compiler.
 
 ---
@@ -218,7 +220,7 @@ code entries        : 6,272
 instructions        : 891,526
 variables/functions : 10,899 / 427 (206,598 var refs, 78,929 func refs)
 sprites/objects/rooms: 2,583 / 1,709 / 336
-unit tests          : 181 passed, 0 failed
+unit tests          : 198 passed, 0 failed
 ```
 
 ---
@@ -228,12 +230,12 @@ unit tests          : 181 passed, 0 failed
 | File | Purpose |
 |---|---|
 | `dw.cpp` / `dw.hpp` | `data.win` parser, chunk unpacker, asset decode, room renderer |
-| `vm.cpp` / `vm.hpp` | Bytecode VM, opcode executor, instance pool, builtins |
+| `vm.cpp` / `vm.hpp` | Bytecode VM, opcode executor, instance pool, builtins, state serialization |
 | `audio.cpp` / `audio.hpp` | Audio engine, multi-voice mixer, PCM sound cache |
 | `bunzip.cpp` / `bunzip.hpp` | Lightweight BZip2 decompression for compressed chunks |
 | `qoi.hpp` | QOI texture decoding header |
 | `gm14.ini.example` | Template engine configuration file |
-| `vm_tests.cpp` | Comprehensive 181-test unit test suite |
+| `vm_tests.cpp` | Comprehensive 198-test unit test suite |
 | `main_runner.cpp` | Interactive desktop runner |
 | `main_host.cpp` | PC driver: parse a `data.win`, print stats, render rooms to PNG |
 | `vm_host.cpp` | Headless VM driver: run a room for N frames, dump a frame |
@@ -251,11 +253,19 @@ unit tests          : 181 passed, 0 failed
 | **Z / Enter** | Confirm / Interact | `ord("Z")`, `vk_enter`, `gp_face1` |
 | **X / Shift** | Cancel / Run / Skip | `ord("X")`, `vk_shift`, `gp_face2` |
 | **C / Ctrl** | Menu / Item / Cell screen | `ord("C")`, `vk_control`, `gp_face3` |
+| **~ (Tilde)** | Toggle Graphical Debug Control Menu | Debug UI toggle |
 | **F4 / Alt+Enter** | Toggle Fullscreen | Hardware display mode toggle |
-| **[ / ]** | Slow down / Speed up (±0.5x) | Engine speed modifier |
-| **\\** | Reset speed to 1.0x | Engine speed modifier |
+| **F5** | Quick Save State (`states/quicksave.state`) | State serializer snapshot |
+| **F8** | Quick Load State (`states/quicksave.state`) | State deserializer snapshot |
+| **Ctrl + G** | Toggle God Mode (Max HP & invulnerability) | Debug cheat |
+| **Ctrl + E** | Toggle Encounters (Disable random battles) | Debug cheat |
+| **Ctrl + S** | Save Anywhere (Trigger save box dialogue) | Debug cheat |
+| **Ctrl + R** | Toggle Input Recording (`session_*.rec`) | Input recorder |
+| **F10** | Synchronized Noclip / Phasing | Debug shortcut |
 | **F1** | Unfreeze player (`global.interact = 0`) | Debug shortcut |
 | **F2** | Dump room & player coordinates | Debug diagnostics |
+| **[ / ]** | Fine slow down / Speed up (±0.5x) | Engine speed modifier |
+| **\\** | Reset speed to 1.0x | Engine speed modifier |
 | **PageUp / PageDown** | Skip rooms backward / forward | Debug room navigation |
 | **Home** | Reload current room | Debug reset |
 
